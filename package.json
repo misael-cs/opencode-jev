@@ -5,8 +5,8 @@
   "type": "module",
   "main": "./dist/src/plugin.js",
   "bin": {
-    "opencode-jev": "./dist/bin/cli.js",
-    "opencode-jev-orchestrator": "./dist/bin/cli.js"
+    "opencode-jev": "dist/bin/cli.js",
+    "opencode-jev-orchestrator": "dist/bin/cli.js"
   },
   "files": [
     "dist",
@@ -45,7 +45,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/misael-cs/opencode-jev.git"
+    "url": "git+https://github.com/misael-cs/opencode-jev.git"
   },
   "homepage": "https://github.com/misael-cs/opencode-jev#readme",
   "bugs": {

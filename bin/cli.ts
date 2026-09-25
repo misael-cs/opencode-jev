@@ -102,7 +102,7 @@ async function install(): Promise<void> {
   let currentConfigText = configText;
   const formattingOptions: ModificationOptions = { formattingOptions: { insertSpaces: true, tabSize: 2 } };
 
-  const pluginEntry = "opencode-jev";
+  const pluginEntry = "opencode-jev-orchestrator";
   let pluginArray = (config.plugin as string[] | undefined) ?? [];
   if (!Array.isArray(pluginArray)) pluginArray = [pluginArray as string];
 
@@ -195,10 +195,10 @@ async function uninstall(): Promise<void> {
     const configText = fs.readFileSync(configPath, "utf8");
     const config = parse(configText) || {};
     let pluginArray = (config.plugin as string[] | undefined) ?? [];
-    pluginArray = pluginArray.filter((p) => p !== "opencode-jev");
+    pluginArray = pluginArray.filter((p) => p !== "opencode-jev-orchestrator" && p !== "opencode-jev");
     const newConfigText = applyEdits(configText, modify(configText, ["plugin"], pluginArray, { formattingOptions: { insertSpaces: true, tabSize: 2 } }));
     fs.writeFileSync(configPath, newConfigText, "utf8");
-    console.log(`[✓] Removed "opencode-jev" from plugin array.`);
+    console.log(`[✓] Removed "opencode-jev-orchestrator" from plugin array.`);
   }
 
   if (fs.existsSync(agentPath)) {

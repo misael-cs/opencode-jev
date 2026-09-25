@@ -1,11 +1,12 @@
 {
-  "name": "opencode-jev",
+  "name": "opencode-jev-orchestrator",
   "version": "1.0.0",
   "description": "JEV Orchestrator plugin for OpenCode — O(1) intra-loop tool routing via Typesafe JEV on OpenRouter",
   "type": "module",
   "main": "./dist/src/plugin.js",
   "bin": {
-    "opencode-jev": "./dist/bin/cli.js"
+    "opencode-jev": "./dist/bin/cli.js",
+    "opencode-jev-orchestrator": "./dist/bin/cli.js"
   },
   "files": [
     "dist",

@@ -14,7 +14,7 @@ const execAsync = promisify(exec);
 
 function getOpencodeConfigDir(): string {
   if (process.platform === "win32") {
-    return path.join(os.homedir(), "AppData", "Roaming", "opencode");
+    return path.join(os.homedir(), ".config", "opencode");
   }
   const xdg = process.env.XDG_CONFIG_HOME;
   return xdg

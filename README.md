@@ -41,11 +41,11 @@ JEV dynamically parses your `opencode.jsonc` file to discover installed MCP (Mod
 ## Installation
 
 ```bash
-npx opencode-jev-orchestrator install
+npx @misaelcs/opencode-jev install
 ```
 
 The installer will:
-1. Add `"opencode-jev-orchestrator"` to your `opencode.jsonc` plugin array.
+1. Add `"@misaelcs/opencode-jev"` to your `opencode.jsonc` plugin array.
 2. Prompt for your OpenRouter API key.
 3. Install the `Jev` agent definition to your OpenCode agent directory.
 
@@ -61,14 +61,14 @@ Restart OpenCode to apply the hook.
 Manage your OpenRouter API Key, Small Model, and Strategic Planner visually:
 
 ```bash
-npx opencode-jev-orchestrator panel
+npx @misaelcs/opencode-jev panel
 # Opens http://localhost:3040
 ```
 *Note on API Keys:* When you save the OpenRouter API Key via the panel, it is safely injected directly into your OS environment variables (`setx` on Windows, or `~/.bashrc` / `~/.zshrc` on Linux/macOS) and mapped securely as `{env:OPENROUTER_API_KEY}` in your config.
 
 **Uninstall:**
 ```bash
-npx opencode-jev-orchestrator uninstall
+npx @misaelcs/opencode-jev uninstall
 ```
 
 ## Routing Categories & Domains

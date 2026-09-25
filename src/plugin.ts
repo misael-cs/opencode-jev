@@ -9,10 +9,7 @@ import { buildDynamicCriteria } from "./catalog.js";
 // ---------------------------------------------------------------------------
 
 function getOpencodeConfigDir(): string {
-  if (process.platform === "win32") {
-    return path.join(os.homedir(), "AppData", "Roaming", "opencode");
-  }
-  // Linux / macOS: XDG_CONFIG_HOME or ~/.config
+  // Linux / macOS / Windows: XDG_CONFIG_HOME or ~/.config
   const xdg = process.env.XDG_CONFIG_HOME;
   return xdg ? path.join(xdg, "opencode") : path.join(os.homedir(), ".config", "opencode");
 }

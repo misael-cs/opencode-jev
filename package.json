@@ -1,5 +1,5 @@
 {
-  "name": "opencode-jev-orchestrator",
+  "name": "@misaelcs/opencode-jev",
   "version": "1.0.0",
   "description": "JEV Orchestrator plugin for OpenCode — O(1) intra-loop tool routing via Typesafe JEV on OpenRouter",
   "type": "module",

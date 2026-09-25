@@ -5,9 +5,6 @@ import os from "os";
 
 // Helper to get API key (similar to plugin.ts)
 function getOpencodeConfigDir(): string {
-  if (process.platform === "win32") {
-    return path.join(os.homedir(), "AppData", "Roaming", "opencode");
-  }
   const xdg = process.env.XDG_CONFIG_HOME;
   return xdg ? path.join(xdg, "opencode") : path.join(os.homedir(), ".config", "opencode");
 }

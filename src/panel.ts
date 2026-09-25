@@ -1,0 +1,286 @@
+import fs from "fs";
+import http from "http";
+import os from "os";
+import path from "path";
+
+// ---------------------------------------------------------------------------
+// Cross-platform config path (mirrors src/plugin.ts)
+// ---------------------------------------------------------------------------
+
+function getOpencodeConfigDir(): string {
+  if (process.platform === "win32") {
+    return path.join(os.homedir(), "AppData", "Roaming", "opencode");
+  }
+  const xdg = process.env.XDG_CONFIG_HOME;
+  return xdg
+    ? path.join(xdg, "opencode")
+    : path.join(os.homedir(), ".config", "opencode");
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+interface ModelEntry {
+  id: string;
+  name: string;
+  provider: string;
+}
+
+interface OpencodeConfig {
+  small_model?: string;
+  decisionModel?: string;
+  disabled_providers?: string[];
+  agent?: {
+    plan?: { model?: string };
+  };
+  provider?: Record<
+    string,
+    {
+      models?: Record<string, { name?: string }>;
+      options?: { apiKey?: string };
+    }
+  >;
+}
+
+interface SavePayload {
+  small_model?: string;
+  planner_model?: string;
+  jev_model?: string;
+  openrouter_key?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Config I/O
+// ---------------------------------------------------------------------------
+
+function readConfig(configPath: string): OpencodeConfig {
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    const clean = raw
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(?<!:)\/\/.*/g, "");
+    return JSON.parse(clean) as OpencodeConfig;
+  } catch (e) {
+    console.error("Error reading config:", (e as Error).message);
+    return {};
+  }
+}
+
+function saveConfig(configPath: string, updates: SavePayload): void {
+  const config = readConfig(configPath);
+
+  if (updates.small_model) config.small_model = updates.small_model;
+
+  if (!config.agent) config.agent = {};
+  if (!config.agent.plan) config.agent.plan = {};
+  if (updates.planner_model) config.agent.plan.model = updates.planner_model;
+
+  if (updates.jev_model) config.decisionModel = updates.jev_model;
+
+  if (updates.openrouter_key?.trim()) {
+    if (!config.provider) config.provider = {};
+    if (!config.provider.openrouter)
+      config.provider.openrouter = { options: { apiKey: "" } };
+    if (!config.provider.openrouter.options)
+      config.provider.openrouter.options = { apiKey: "" };
+    config.provider.openrouter.options.apiKey = updates.openrouter_key.trim();
+  }
+
+  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf8");
+}
+
+// ---------------------------------------------------------------------------
+// Model enumeration
+// ---------------------------------------------------------------------------
+
+const BUILTIN_MODELS: ModelEntry[] = [
+  { id: "opencodezen/Ling-3.0-Flash-Fin", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/MiMo-V2.6-Flash", name: "MiMo-V2.6-Flash Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/Muse-Spark-1.2", name: "Muse Spark 1.2 Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/Muse-Spark-1.3", name: "Muse Spark 1.3 Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/Nemotron-3-Ultra", name: "Nemotron 3 Ultra Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/Nemotron-3.5-Lightning", name: "Nemotron 3.5 Lightning Free", provider: "OpenCode Zen" },
+  { id: "opencodezen/Space-Bunny", name: "Space Bunny Free", provider: "OpenCode Zen" },
+];
+
+function getAvailableModels(config: OpencodeConfig): ModelEntry[] {
+  const disabled = config.disabled_providers ?? [];
+  const dynamic: ModelEntry[] = [];
+
+  if (config.provider) {
+    for (const [prov, provData] of Object.entries(config.provider)) {
+      if (disabled.includes(prov)) continue;
+      if (provData.models) {
+        for (const [modId, modData] of Object.entries(provData.models)) {
+          const niceProv = prov.charAt(0).toUpperCase() + prov.slice(1);
+          dynamic.push({
+            id: `${prov}/${modId}`,
+            name: modData.name ?? modId,
+            provider: niceProv,
+          });
+        }
+      }
+    }
+  }
+
+  const all = [...BUILTIN_MODELS];
+  for (const m of dynamic) {
+    if (!all.find((x) => x.id === m.id)) all.push(m);
+  }
+
+  // Keep currently saved models even if not in list
+  const currentModels = [config.small_model, config.agent?.plan?.model];
+  for (const m of currentModels) {
+    if (m && !all.find((x) => x.id === m || `${x.id}-Free` === m)) {
+      all.push({ id: m, name: `${m} (implicit/external)`, provider: "Other" });
+    }
+  }
+
+  return all;
+}
+
+function buildSelectOptions(models: ModelEntry[], selected?: string): string {
+  const groups: Record<string, ModelEntry[]> = {};
+  for (const m of models) {
+    if (!groups[m.provider]) groups[m.provider] = [];
+    groups[m.provider].push(m);
+  }
+
+  let html = "";
+  for (const [provider, provModels] of Object.entries(groups)) {
+    html += `  <optgroup label="${provider}">\n`;
+    for (const m of provModels) {
+      const isSelected =
+        selected &&
+        (m.id === selected || m.id === selected.replace(/-Free$/i, ""))
+          ? "selected"
+          : "";
+      html += `    <option value="${m.id}" ${isSelected}>${m.name}</option>\n`;
+    }
+    html += `  </optgroup>\n`;
+  }
+  return html;
+}
+
+// ---------------------------------------------------------------------------
+// HTML panel
+// ---------------------------------------------------------------------------
+
+function renderPanel(config: OpencodeConfig): string {
+  const models = getAvailableModels(config);
+  const currentKey = config.provider?.openrouter?.options?.apiKey ?? "";
+  const safeKey =
+    currentKey && !currentKey.startsWith("{env:") ? currentKey : "";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>JEV Orchestrator — Control Panel</title>
+  <style>
+    body { font-family: system-ui; background: #111; color: #eee; padding: 2rem; max-width: 700px; margin: auto; }
+    label { display: block; margin-top: 1.5rem; font-weight: bold; color: #93c5fd; }
+    p.desc { font-size: 0.85rem; color: #888; margin-top: 0.25rem; margin-bottom: 0.5rem; }
+    select, input { width: 100%; padding: 0.75rem; background: #222; color: #fff; border: 1px solid #444; border-radius: 4px; box-sizing: border-box; }
+    input[readonly] { opacity: 0.5; cursor: not-allowed; }
+    button { margin-top: 2rem; padding: 1rem 2rem; background: #3b82f6; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; width: 100%; font-size: 1rem; }
+    button:hover { background: #2563eb; }
+    .notice { background: #1e293b; border-left: 4px solid #3b82f6; padding: 1rem; margin-bottom: 2rem; font-size: 0.9rem; line-height: 1.5; }
+    optgroup { color: #9ca3af; font-weight: bold; font-style: normal; }
+    option { color: #fff; font-weight: normal; }
+  </style>
+</head>
+<body>
+  <h2>JEV Orchestrator — Control Panel</h2>
+  <div class="notice">
+    The <strong>Core Worker</strong> (primary model) is not managed here.
+    Change it freely in the OpenCode TUI. Use this panel only to govern the
+    auxiliary and background orchestration layers.
+  </div>
+  <form id="configForm">
+    <label>OpenRouter API Key
+      <p class="desc">Access key (sk-or-v1-...). The plugin reads this directly from opencode.jsonc to avoid Windows environment variable issues.</p>
+      <input type="password" name="openrouter_key" value="${safeKey}" placeholder="sk-or-v1-...">
+    </label>
+
+    <label>Intra-Loop Router (Decision Model)
+      <p class="desc">The deterministic classifier that governs tool routing in the background.</p>
+      <input type="text" name="jev_model" value="${config.decisionModel ?? "typesafe/jev-1.13"}" readonly title="Fixed for OpenRouter/Typesafe integration.">
+    </label>
+
+    <label>Context Harvester / Scraper (Small Model)
+      <p class="desc">Reads massive logs, global scans — high speed and low cost.</p>
+      <select name="small_model">
+        ${buildSelectOptions(models, config.small_model)}
+      </select>
+    </label>
+
+    <label>Strategic Planner (Fallback Agent)
+      <p class="desc">Rescue actor activated by JEV for architecture decisions or stuck loops.</p>
+      <select name="planner_model">
+        ${buildSelectOptions(models, config.agent?.plan?.model)}
+      </select>
+    </label>
+
+    <button type="submit">Save Orchestration Config</button>
+  </form>
+  <script>
+    document.getElementById('configForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const formData = new FormData(e.target);
+      const data = Object.fromEntries(formData.entries());
+      const response = await fetch('/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      });
+      if (response.ok) alert('Orchestration config saved to opencode.jsonc!');
+      else alert('Error saving config.');
+    });
+  </script>
+</body>
+</html>`;
+}
+
+// ---------------------------------------------------------------------------
+// Server factory — exported so the CLI can call startPanel(port)
+// ---------------------------------------------------------------------------
+
+export function startPanel(port = 3040, configDir?: string): void {
+  const resolvedConfigDir = configDir ?? getOpencodeConfigDir();
+  const configPath = path.join(resolvedConfigDir, "opencode.jsonc");
+
+  const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/") {
+      const config = readConfig(configPath);
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(renderPanel(config));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/save") {
+      let body = "";
+      req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+      req.on("end", () => {
+        try {
+          saveConfig(configPath, JSON.parse(body) as SavePayload);
+          res.writeHead(200);
+          res.end("OK");
+        } catch (e) {
+          res.writeHead(500);
+          res.end((e as Error).message);
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404);
+    res.end();
+  });
+
+  server.listen(port, () => {
+    console.log(`JEV Control Panel running at http://localhost:${port}`);
+    console.log("Press Ctrl+C to stop.");
+  });
+}

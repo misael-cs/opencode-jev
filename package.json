@@ -1,0 +1,53 @@
+{
+  "name": "opencode-jev",
+  "version": "1.0.0",
+  "description": "JEV Orchestrator plugin for OpenCode — O(1) intra-loop tool routing via Typesafe JEV on OpenRouter",
+  "type": "module",
+  "main": "./dist/src/plugin.js",
+  "bin": {
+    "opencode-jev": "./dist/bin/cli.js"
+  },
+  "files": [
+    "dist",
+    "agent"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "jev",
+    "openrouter",
+    "typesafe",
+    "routing",
+    "agent",
+    "orchestrator"
+  ],
+  "author": "misael-cs",
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/misael-cs/opencode-jev.git"
+  },
+  "homepage": "https://github.com/misael-cs/opencode-jev#readme",
+  "bugs": {
+    "url": "https://github.com/misael-cs/opencode-jev/issues"
+  }
+}

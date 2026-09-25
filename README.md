@@ -1,19 +1,42 @@
 # opencode-jev
 
-JEV Orchestrator plugin for [OpenCode](https://opencode.ai) — O(1) intra-loop tool routing via the [Typesafe JEV](https://openrouter.ai/typesafe/jev-1.13) model on OpenRouter.
+The **JEV Orchestrator** is an ultra-aggressive, high-performance plugin for [OpenCode](https://opencode.ai). It replaces traditional "System 2" LLM tool-calling loops with a deterministic, non-autoregressive **System 1** classifier via [Typesafe JEV](https://openrouter.ai/typesafe/jev-1.13) on OpenRouter.
 
-## What is JEV?
+By intercepting the agentic loop, JEV evaluates the state of the conversation in **O(1) latency** (~150ms) and simultaneously determines two critical axes:
+1. **The Tool Domain:** Which tool or MCP server should be used.
+2. **The Task Complexity:** How deep the cognitive reasoning needs to be.
 
-Traditional agentic loops (System 2) require the LLM to generate a Chain-of-Thought before selecting a tool. This costs tokens and latency on every turn.
+## Core Capabilities
 
-JEV is a non-autoregressive **System 1** classifier: it reads the user context and returns the correct tool domain in O(1) time, before the main LLM acts. The LLM then acts as a "blind" executor, formatting only the tool call JEV designated — skipping CoT entirely.
+### 1. Dynamic Complexity Routing (On-The-Fly Model Swapping)
+Traditional agentic loops use a single heavy model (e.g., Claude 3.5 Sonnet) for everything—from writing complex algorithms to running `ls` or reading a terminal error. JEV evaluates the cognitive complexity of each turn and dynamically swaps the model in the background:
+- 🟢 **`TRIVIAL`:** (Simple text formatting, reading single files, standard terminal execution). The plugin forces OpenCode to use an ultra-fast, cheap **Small Model** (e.g., MiMo, Gemini Flash).
+- 🟡 **`STANDARD`:** (Writing components, local refactoring). The plugin preserves your default **Core Worker** (e.g., Sonnet 4.6).
+- 🔴 **`COMPLEX`:** (Deep algorithmic debugging, race conditions, systemic failures). The plugin escalates to the **Strategic Planner** (e.g., Claude Opus Thinking). Once resolved, the next turn gracefully downscales back to trivial.
 
-If JEV confidence is below 60%, or if the API is unavailable, the hook bypasses silently and lets the native LLM reason freely. No disruption to normal operation.
+### 2. Algorithmic Search & Classification (The JEV CLI)
+Do not waste thousands of tokens using `grep` or reading entire files into context. The JEV CLI empowers the LLM to search for *semantic concepts* algorithmically across your entire codebase or Obsidian Vault.
+```bash
+npx opencode-jev scan "Does this file contain the database connection string?" ./src/
+```
+The CLI chunks the files, queries JEV in parallel, and returns the exact matching files in seconds.
+
+### 3. Persistent Context Basket (Anti-Amnesia Memory)
+Long LLM loops suffer from context-window sliding. JEV fixes this by shifting memory management to the agent itself. At any time, the LLM can run:
+```bash
+npx opencode-jev context "Update: 1. DB setup complete. 2. Bug is in line 45."
+```
+This updates a persistent file in the workspace (`.opencode/jev_context.md`) that the JEV plugin automatically injects into the very top of the System Prompt on every subsequent turn, completely eliminating context loss.
+
+### 4. Dynamic MCP Routing
+JEV dynamically parses your `opencode.jsonc` file to discover installed MCP (Model Context Protocol) servers. It cross-references them with a rich internal semantic catalog (`obsidian`, `postgres`, `github`, `puppeteer`, etc.) and automatically routes intents to external technologies with zero hardcoding.
+
+---
 
 ## Prerequisites
 
-- [OpenCode](https://opencode.ai) installed and run at least once
-- An [OpenRouter](https://openrouter.ai) API key (`sk-or-v1-...`) with access to `typesafe/jev-1.13`
+- [OpenCode](https://opencode.ai) installed and run at least once.
+- An [OpenRouter](https://openrouter.ai) API key (`sk-or-v1-...`) with access to `typesafe/jev-1.13`.
 
 ## Installation
 
@@ -22,40 +45,35 @@ npx opencode-jev install
 ```
 
 The installer will:
-1. Add `"opencode-jev"` to your `opencode.jsonc` plugin array
-2. Prompt for your OpenRouter API key and save it to config
-3. Install the `Jev` agent definition to your OpenCode agent directory
+1. Add `"opencode-jev"` to your `opencode.jsonc` plugin array.
+2. Prompt for your OpenRouter API key.
+3. Install the `Jev` agent definition to your OpenCode agent directory.
 
-Then restart OpenCode.
+Restart OpenCode to apply the hook.
 
 ## Usage
 
-**Enable JEV routing:** Press `Ctrl+O` in OpenCode and select the **Jev** agent.
+**Enable the Orchestrator:** Press `Ctrl+O` in OpenCode and select the **Jev** agent.
 
-**Disable:** Switch back to any other agent (Build, Plan, etc.) — the hook bypasses automatically.
+**Disable:** Switch back to any other agent — the hook bypasses automatically.
 
-**Control Panel** (manage auxiliary models and API key):
+### Web Control Panel
+Manage your OpenRouter API Key, Small Model, and Strategic Planner visually:
 
 ```bash
 npx opencode-jev panel
 # Opens http://localhost:3040
 ```
-
-Optional port:
-
-```bash
-npx opencode-jev panel 4000
-```
+*Note on API Keys:* When you save the OpenRouter API Key via the panel, it is safely injected directly into your OS environment variables (`setx` on Windows, or `~/.bashrc` / `~/.zshrc` on Linux/macOS) and mapped securely as `{env:OPENROUTER_API_KEY}` in your config.
 
 **Uninstall:**
-
 ```bash
 npx opencode-jev uninstall
 ```
 
-## Routing Categories
+## Routing Categories & Domains
 
-JEV classifies each turn into one of 8 tool domains:
+JEV evaluates the context against core domains + your installed MCPs:
 
 | Category | When used |
 |---|---|
@@ -67,29 +85,18 @@ JEV classifies each turn into one of 8 tool domains:
 | `INFRA_MANAGEMENT` | VPS, DNS, Hostinger, domain management |
 | `WORKFLOW_CONTROL` | TODOs, sub-agents, asking the user questions |
 | `FINAL_ANSWER` | Prose-only responses, no tool needed |
+| `MCP_*` | Dynamically generated based on your installed MCP servers |
 
 ## Debug Log
 
-All hook activity, bypasses and errors are written to:
-
+All hook activity, classifications, and dynamic model swaps are logged to:
 - **Windows:** `%APPDATA%\opencode\jev_debug.log`
 - **Linux/macOS:** `~/.config/opencode/jev_debug.log`
 
-## Known Limitations
+## Resiliency Architecture
 
-- **Log-scan detection:** JEV activation is detected by scanning the OpenCode runtime log for `agent=Jev`. A 250ms delay is introduced at hook start to ensure OpenCode has flushed the log to disk.
-- **Plaintext API key:** The OpenRouter key is stored in `opencode.jsonc`. A future version will support `{env:OPENROUTER_API_KEY}` once OpenCode resolves env vars in plugin hooks reliably on Windows.
-- **Confidence tuning:** If JEV consistently bypasses on a specific task, sharpen the `criteria` descriptions in `src/plugin.ts` — JEV's routing is entirely semantic, no retraining required.
-
-## Control Panel
-
-The panel (`npx opencode-jev panel`) manages three background layers:
-
-- **OpenRouter API Key** — consumed by the plugin hook
-- **Small Model** — Context Harvester for log scanning and fast tasks
-- **Strategic Planner** — Fallback agent for complex architecture decisions
-
-The primary Core Worker model is intentionally excluded — change it directly in the OpenCode TUI.
+- **Fail-Safe Bypasses:** If JEV confidence falls below 60%, if the OpenRouter API goes offline, or if rate limits are hit, the plugin fails silently and transparently passes execution back to the Core LLM to maintain standard OpenCode behavior without disruption.
+- **Strict JSONC Parsing:** The plugin uses Microsoft's `jsonc-parser` to inject variables via AST without removing your custom comments, formatting, or breaking existing configuration files.
 
 ## License
 

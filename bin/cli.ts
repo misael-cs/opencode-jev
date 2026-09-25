@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import readline from "readline";
 import { fileURLToPath } from "url";
+import { parse, modify, applyEdits, ModificationOptions } from "jsonc-parser";
 
 // ---------------------------------------------------------------------------
 // Cross-platform path resolution
@@ -29,14 +30,7 @@ function getOpencodeAgentDir(): string {
 
 function readJsonc(filePath: string): Record<string, unknown> {
   const raw = fs.readFileSync(filePath, "utf8");
-  const clean = raw
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(?<!:)\/\/.*/g, "");
-  return JSON.parse(clean) as Record<string, unknown>;
-}
-
-function writeJson(filePath: string, data: unknown): void {
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
+  return parse(raw) as Record<string, unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +97,10 @@ async function install(): Promise<void> {
   }
 
   // 2. Patch plugin array
-  const config = readJsonc(configPath);
+  const configText = fs.readFileSync(configPath, "utf8");
+  const config = parse(configText) || {};
+  let currentConfigText = configText;
+  const formattingOptions: ModificationOptions = { formattingOptions: { insertSpaces: true, tabSize: 2 } };
 
   const pluginEntry = "opencode-jev";
   let pluginArray = (config.plugin as string[] | undefined) ?? [];
@@ -113,7 +110,7 @@ async function install(): Promise<void> {
     console.log(`[✓] Plugin entry already present in opencode.jsonc.`);
   } else {
     pluginArray.push(pluginEntry);
-    config.plugin = pluginArray;
+    currentConfigText = applyEdits(currentConfigText, modify(currentConfigText, ["plugin"], pluginArray, formattingOptions));
     console.log(`[+] Added "${pluginEntry}" to plugin array.`);
   }
 
@@ -139,17 +136,12 @@ async function install(): Promise<void> {
   }
 
   if (apiKey.trim()) {
-    if (!config.provider) config.provider = {};
-    const provider = config.provider as Record<string, unknown>;
-    if (!provider.openrouter) provider.openrouter = {};
-    const openrouter = provider.openrouter as Record<string, unknown>;
-    if (!openrouter.options) openrouter.options = {};
-    (openrouter.options as Record<string, string>).apiKey = apiKey.trim();
+    currentConfigText = applyEdits(currentConfigText, modify(currentConfigText, ["provider", "openrouter", "options", "apiKey"], apiKey.trim(), formattingOptions));
     console.log(`[+] OpenRouter API key saved.`);
   }
 
   // 4. Write config back
-  writeJson(configPath, config);
+  fs.writeFileSync(configPath, currentConfigText, "utf8");
   console.log(`[✓] opencode.jsonc updated.`);
 
   // 5. Copy agent/jev.md
@@ -200,11 +192,12 @@ async function uninstall(): Promise<void> {
   }
 
   if (fs.existsSync(configPath)) {
-    const config = readJsonc(configPath);
+    const configText = fs.readFileSync(configPath, "utf8");
+    const config = parse(configText) || {};
     let pluginArray = (config.plugin as string[] | undefined) ?? [];
     pluginArray = pluginArray.filter((p) => p !== "opencode-jev");
-    config.plugin = pluginArray;
-    writeJson(configPath, config);
+    const newConfigText = applyEdits(configText, modify(configText, ["plugin"], pluginArray, { formattingOptions: { insertSpaces: true, tabSize: 2 } }));
+    fs.writeFileSync(configPath, newConfigText, "utf8");
     console.log(`[✓] Removed "opencode-jev" from plugin array.`);
   }
 
@@ -228,6 +221,46 @@ async function panel(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// scan
+// ---------------------------------------------------------------------------
+
+async function scan(): Promise<void> {
+  const question = process.argv[3];
+  const targetPath = process.argv[4] || ".";
+
+  if (!question) {
+    console.error("Usage: npx opencode-jev scan \"your question\" [path]");
+    process.exit(1);
+  }
+
+  const { runScan } = await import("../src/scanner.js");
+  await runScan(question, targetPath);
+}
+
+// ---------------------------------------------------------------------------
+// context
+// ---------------------------------------------------------------------------
+
+async function context(): Promise<void> {
+  const data = process.argv[3];
+  if (!data) {
+    console.error("Usage: npx opencode-jev context \"Your summary here\"");
+    process.exit(1);
+  }
+
+  const workspaceDir = process.cwd();
+  const opencodeDir = path.join(workspaceDir, ".opencode");
+  
+  if (!fs.existsSync(opencodeDir)) {
+    fs.mkdirSync(opencodeDir, { recursive: true });
+  }
+
+  const contextFile = path.join(opencodeDir, "jev_context.md");
+  fs.writeFileSync(contextFile, data, "utf8");
+  console.log("[✓] Context basket updated successfully.");
+}
+
+// ---------------------------------------------------------------------------
 // help
 // ---------------------------------------------------------------------------
 
@@ -239,6 +272,8 @@ Usage:
   npx opencode-jev install        Install plugin and agent into OpenCode config
   npx opencode-jev uninstall      Remove plugin and agent from OpenCode config
   npx opencode-jev panel [port]   Start the web control panel (default port: 3040)
+  npx opencode-jev scan "query" [path] Semantic search using JEV to classify file contents
+  npx opencode-jev context "text" Updates the persistent memory basket for the LLM
   npx opencode-jev --help         Show this help
 
 What is JEV?
@@ -280,6 +315,12 @@ switch (command) {
     break;
   case "panel":
     panel().catch((e) => { console.error(e); process.exit(1); });
+    break;
+  case "scan":
+    scan().catch((e) => { console.error(e); process.exit(1); });
+    break;
+  case "context":
+    context().catch((e) => { console.error(e); process.exit(1); });
     break;
   case "--help":
   case "-h":

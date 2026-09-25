@@ -49,5 +49,8 @@
   "homepage": "https://github.com/misael-cs/opencode-jev#readme",
   "bugs": {
     "url": "https://github.com/misael-cs/opencode-jev/issues"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1"
   }
 }

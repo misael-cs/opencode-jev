@@ -1,6 +1,8 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { parse } from "jsonc-parser";
+import { buildDynamicCriteria } from "./catalog.js";
 
 // ---------------------------------------------------------------------------
 // Cross-platform path resolution
@@ -15,20 +17,8 @@ function getOpencodeConfigDir(): string {
   return xdg ? path.join(xdg, "opencode") : path.join(os.homedir(), ".config", "opencode");
 }
 
-function getOpencodeLogPath(): string {
-  if (process.platform === "win32") {
-    const local = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-    return path.join(local, "opencode", "log", "opencode.log");
-  }
-  // Linux / macOS: XDG_DATA_HOME or ~/.local/share
-  const xdgData = process.env.XDG_DATA_HOME;
-  const base = xdgData ?? path.join(os.homedir(), ".local", "share");
-  return path.join(base, "opencode", "log", "opencode.log");
-}
-
 const CONFIG_DIR = getOpencodeConfigDir();
 const JEV_DEBUG_LOG = path.join(CONFIG_DIR, "jev_debug.log");
-const OPENCODE_LOG = getOpencodeLogPath();
 const OPENCODE_JSONC = path.join(CONFIG_DIR, "opencode.jsonc");
 
 // ---------------------------------------------------------------------------
@@ -44,19 +34,6 @@ function log(msg: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Config reader — strips JSONC comments before parsing
-// ---------------------------------------------------------------------------
-
-function readJsonc(filePath: string): Record<string, unknown> {
-  const raw = fs.readFileSync(filePath, "utf8");
-  // Remove block comments first, then line comments (skip URLs: https://)
-  const clean = raw
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(?<!:)\/\/.*/g, "");
-  return JSON.parse(clean) as Record<string, unknown>;
-}
-
-// ---------------------------------------------------------------------------
 // Resolve OpenRouter API key
 // Priority: env var → opencode.jsonc provider.openrouter.options.apiKey
 // ---------------------------------------------------------------------------
@@ -67,46 +44,26 @@ function resolveApiKey(): string | undefined {
 
   try {
     if (fs.existsSync(OPENCODE_JSONC)) {
-      const config = readJsonc(OPENCODE_JSONC);
-      const provider = config.provider as Record<string, unknown> | undefined;
+      const raw = fs.readFileSync(OPENCODE_JSONC, "utf8");
+      const config = parse(raw) as Record<string, unknown>;
+      const provider = config?.provider as Record<string, unknown> | undefined;
       const openrouter = provider?.openrouter as Record<string, unknown> | undefined;
       const options = openrouter?.options as Record<string, unknown> | undefined;
       const key = options?.apiKey as string | undefined;
-      // Reject {env:...} placeholders — they weren't resolved
-      if (key && !key.startsWith("{env:")) return key;
+      
+      if (key) {
+        if (key.startsWith("{env:") && key.endsWith("}")) {
+          const envName = key.slice(5, -1);
+          return process.env[envName];
+        }
+        return key;
+      }
     }
   } catch (e) {
     log(`Error reading apiKey from opencode.jsonc: ${(e as Error).message}`);
   }
 
   return undefined;
-}
-
-// ---------------------------------------------------------------------------
-// Detect whether the active OpenCode session is using the "Jev" agent
-// by scanning the tail of the OpenCode log for the current sessionID.
-// ---------------------------------------------------------------------------
-
-function isJevAgentActive(sessionID: string): boolean {
-  try {
-    if (!fs.existsSync(OPENCODE_LOG)) return false;
-
-    const content = fs.readFileSync(OPENCODE_LOG, "utf8");
-    const lines = content.trim().split("\n");
-    const scanFrom = Math.max(0, lines.length - 150);
-
-    for (let i = lines.length - 1; i >= scanFrom; i--) {
-      const line = lines[i];
-      if (line.includes(`session.id=${sessionID}`) && line.includes("agent=")) {
-        // Strip ANSI color codes before matching
-        const clean = line.replace(/\u001b\[.*?m/g, "").toLowerCase();
-        return clean.includes("agent=jev");
-      }
-    }
-  } catch (e) {
-    log(`Error reading opencode log: ${(e as Error).message}`);
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,17 +75,22 @@ interface JevAnswer {
   confidence: number;
 }
 
+interface JevAnswers {
+  next_tool_domain?: JevAnswer;
+  task_complexity?: JevAnswer;
+}
+
 interface JevResponse {
-  answers: {
-    next_tool_domain: JevAnswer;
-  };
+  answers: JevAnswers;
 }
 
 async function queryJev(
   apiKey: string,
-  contextString: string
-): Promise<JevAnswer | null> {
+  contextString: string,
+  mcpConfig: Record<string, unknown> | undefined
+): Promise<JevAnswers | null> {
   const MAX_RETRIES = 3;
+  const criteria = buildDynamicCriteria(mcpConfig);
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
@@ -146,27 +108,18 @@ async function queryJev(
           questions: {
             next_tool_domain: {
               type: "choice",
-              instructions:
-                "What is the domain of the next tool to be used based on the user context?",
-              criteria: {
-                FS_READ:
-                  "Read code, read files, explore directories, search for files or inspect content in the local repository.",
-                FS_WRITE:
-                  "Write, edit, modify or create new source code files.",
-                OS_EXECUTION:
-                  "Run scripts (.ps1, .sh), start containers (docker), servers, or execute commands in the terminal/shell.",
-                WEB_AUTOMATION:
-                  "Automated web tests, browser control (Playwright), page inspection or web scraping.",
-                KNOWLEDGE_RETRIEVAL:
-                  "Search in Obsidian knowledge base, run Google searches, or read documentation from the internet.",
-                INFRA_MANAGEMENT:
-                  "Actions related to infrastructure, VPS, Hostinger servers, DNS, or managing web domains.",
-                WORKFLOW_CONTROL:
-                  "Create task lists (TODO), ask the user for additional information, or delegate sub-agents.",
-                FINAL_ANSWER:
-                  "Only respond discursively when no file or terminal action is required.",
-              },
+              instructions: "What is the domain of the next tool to be used based on the user context?",
+              criteria,
             },
+            task_complexity: {
+              type: "choice",
+              instructions: "Rate the cognitive complexity, reasoning depth, and risk of the task requested by the user.",
+              criteria: {
+                TRIVIAL: "Simple text formatting, boilerplate generation, single-file reading, bash execution of standard commands (ls, npm start), answering basic questions, or summarizing.",
+                STANDARD: "Standard software engineering tasks, writing new components based on scope, refactoring local logic, or connecting known APIs.",
+                COMPLEX: "Deep algorithmic debugging, complex architecture design, race condition investigation, cascading failures across multiple files, or a task that has failed repeatedly."
+              }
+            }
           },
           state: { context: contextString },
         }),
@@ -181,8 +134,8 @@ async function queryJev(
       }
 
       const data = (await response.json()) as JevResponse;
-      if (data?.answers?.next_tool_domain) {
-        return data.answers.next_tool_domain;
+      if (data?.answers) {
+        return data.answers;
       }
       throw new Error("Malformed response from OpenRouter decisions API");
     } catch (err) {
@@ -220,11 +173,9 @@ export default (async ({ client, project }: { client: unknown; project: unknown 
           return;
         }
 
-        // Small delay to ensure OpenCode has flushed the session/agent info to disk
-        await new Promise((r) => setTimeout(r, 250));
-
-        if (!isJevAgentActive(input.sessionID)) {
-          log("Bypass: active agent is not Jev.");
+        const systemPrompt = input.system ?? "";
+        if (!systemPrompt.includes("[JEV_ORCHESTRATOR_ENABLED]")) {
+          log("Bypass: active agent is not Jev (missing [JEV_ORCHESTRATOR_ENABLED] in system prompt).");
           return;
         }
 
@@ -253,21 +204,78 @@ export default (async ({ client, project }: { client: unknown; project: unknown 
           return;
         }
 
-        const answer = await queryJev(apiKey, contextString);
-        if (!answer) return;
+        // Read config from opencode.jsonc
+        let mcpConfig: Record<string, unknown> | undefined = undefined;
+        let smallModel = "";
+        let plannerModel = "";
+        try {
+          if (fs.existsSync(OPENCODE_JSONC)) {
+            const raw = fs.readFileSync(OPENCODE_JSONC, "utf8");
+            const config = parse(raw) as Record<string, unknown>;
+            mcpConfig = config?.mcp as Record<string, unknown> | undefined;
+            smallModel = (config?.small_model as string) || "";
+            plannerModel = (config?.agent as any)?.plan?.model || "";
+          }
+        } catch (e) {
+          log(`Error reading opencode config: ${(e as Error).message}`);
+        }
 
-        log(`JEV answered: ${answer.choice} (confidence: ${answer.confidence})`);
+        const answers = await queryJev(apiKey, contextString, mcpConfig);
+        if (!answers || !answers.next_tool_domain) return;
 
-        if (typeof answer.confidence === "number" && answer.confidence < 0.6) {
-          log(`Bypass: low confidence (${answer.confidence}).`);
+        const domainAns = answers.next_tool_domain;
+        const compAns = answers.task_complexity;
+
+        log(`JEV domain: ${domainAns.choice} (conf: ${domainAns.confidence})`);
+        if (compAns) log(`JEV complexity: ${compAns.choice} (conf: ${compAns.confidence})`);
+
+        if (typeof domainAns.confidence === "number" && domainAns.confidence < 0.6) {
+          log(`Bypass: low domain confidence (${domainAns.confidence}).`);
           return;
         }
 
+        // Apply Complexity Routing
+        let injectedModel = "";
+        if (compAns && typeof compAns.confidence === "number" && compAns.confidence > 0.5) {
+          if (compAns.choice === "TRIVIAL" && smallModel) {
+            injectedModel = smallModel;
+            log(`Complexity TRIVIAL -> Routing to Small Model: ${smallModel}`);
+          } else if (compAns.choice === "COMPLEX" && plannerModel) {
+            injectedModel = plannerModel;
+            log(`Complexity COMPLEX -> Routing to Strategic Planner: ${plannerModel}`);
+          } else {
+            log(`Complexity STANDARD (or no alternative models configured) -> Keeping Core Worker.`);
+          }
+        }
+
         log("Injecting routing directive into system prompt.");
-        const base = output.system ?? input.system ?? "";
+        let base = output.system ?? input.system ?? "";
+        
+        // Inject Context Basket if it exists in the workspace
+        try {
+          const workspaceDir = process.cwd();
+          const contextPath = path.join(workspaceDir, ".opencode", "jev_context.md");
+          if (fs.existsSync(contextPath)) {
+            const contextContent = fs.readFileSync(contextPath, "utf8");
+            if (contextContent.trim()) {
+              base += `\n\n[JEV CONTEXT BASKET / MEMORY]:\n${contextContent.trim()}\n(Note: you can update this memory using \`opencode-jev context "new text"\`)`;
+            }
+          }
+        } catch (e) {
+          log(`Failed to inject context basket: ${(e as Error).message}`);
+        }
+
         output.system =
           base +
-          `\n\n[JEV INTRA-LOOP DIRECTIVE]: You MUST NOT reflect or use Chain of Thought. Your ONLY function is to strictly format a tool call compatible with this category: ${answer.choice}. Write nothing else.`;
+          `\n\n[JEV INTRA-LOOP DIRECTIVE]: You MUST NOT reflect or use Chain of Thought. Your ONLY function is to strictly format a tool call compatible with this category: ${domainAns.choice}. Write nothing else.`;
+        
+        // Attempt to dynamically swap the model via the output object.
+        // Some host clients (like LibreChat/OpenCode) allow mutating `output.model` or `output.req.model`
+        if (injectedModel) {
+          (output as any).model = injectedModel;
+          if (!(output as any).req) (output as any).req = {};
+          (output as any).req.model = injectedModel;
+        }
       } catch (fatalError) {
         log(`Fatal error in hook: ${(fatalError as Error).message}`);
       }

@@ -2,6 +2,11 @@ import fs from "fs";
 import http from "http";
 import os from "os";
 import path from "path";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { parse, modify, applyEdits, ModificationOptions } from "jsonc-parser";
+
+const execAsync = promisify(exec);
 
 // ---------------------------------------------------------------------------
 // Cross-platform config path (mirrors src/plugin.ts)
@@ -54,40 +59,87 @@ interface SavePayload {
 // Config I/O
 // ---------------------------------------------------------------------------
 
+async function setEnvVarOS(key: string, value: string): Promise<void> {
+  try {
+    if (process.platform === "win32") {
+      await execAsync(`setx ${key} "${value}"`);
+    } else {
+      // Linux/macOS: Append or replace in ~/.bashrc and ~/.zshrc
+      const bashrc = path.join(os.homedir(), ".bashrc");
+      const zshrc = path.join(os.homedir(), ".zshrc");
+      const exportLine = `\nexport ${key}="${value}"\n`;
+
+      const updateRcFile = (rcPath: string) => {
+        if (!fs.existsSync(rcPath)) return;
+        const content = fs.readFileSync(rcPath, "utf8");
+        const regex = new RegExp(`^export ${key}=.*$`, "m");
+        if (regex.test(content)) {
+          const newContent = content.replace(regex, `export ${key}="${value}"`);
+          fs.writeFileSync(rcPath, newContent);
+        } else {
+          fs.appendFileSync(rcPath, exportLine);
+        }
+      };
+
+      updateRcFile(bashrc);
+      updateRcFile(zshrc);
+    }
+    console.log(`Successfully registered ${key} in OS environment.`);
+  } catch (err) {
+    console.error(`Failed to set OS environment variable ${key}:`, err);
+  }
+}
+
 function readConfig(configPath: string): OpencodeConfig {
   try {
     const raw = fs.readFileSync(configPath, "utf8");
-    const clean = raw
-      .replace(/\/\*[\s\S]*?\*\//g, "")
-      .replace(/(?<!:)\/\/.*/g, "");
-    return JSON.parse(clean) as OpencodeConfig;
+    return parse(raw) as OpencodeConfig || {};
   } catch (e) {
     console.error("Error reading config:", (e as Error).message);
     return {};
   }
 }
 
-function saveConfig(configPath: string, updates: SavePayload): void {
-  const config = readConfig(configPath);
+async function saveConfig(configPath: string, updates: SavePayload): Promise<void> {
+  const text = fs.readFileSync(configPath, "utf8");
+  const parsed = parse(text);
+  
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error("Cannot parse opencode.jsonc. Aborting save to prevent data loss.");
+  }
+  
+  let currentText = text;
+  const options: ModificationOptions = { formattingOptions: { insertSpaces: true, tabSize: 2 } };
 
-  if (updates.small_model) config.small_model = updates.small_model;
-
-  if (!config.agent) config.agent = {};
-  if (!config.agent.plan) config.agent.plan = {};
-  if (updates.planner_model) config.agent.plan.model = updates.planner_model;
-
-  if (updates.jev_model) config.decisionModel = updates.jev_model;
-
-  if (updates.openrouter_key?.trim()) {
-    if (!config.provider) config.provider = {};
-    if (!config.provider.openrouter)
-      config.provider.openrouter = { options: { apiKey: "" } };
-    if (!config.provider.openrouter.options)
-      config.provider.openrouter.options = { apiKey: "" };
-    config.provider.openrouter.options.apiKey = updates.openrouter_key.trim();
+  if (updates.small_model) {
+    currentText = applyEdits(currentText, modify(currentText, ["small_model"], updates.small_model, options));
   }
 
-  fs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf8");
+  if (updates.planner_model) {
+    currentText = applyEdits(currentText, modify(currentText, ["agent", "plan", "model"], updates.planner_model, options));
+  }
+
+  if (updates.jev_model) {
+    currentText = applyEdits(currentText, modify(currentText, ["decisionModel"], updates.jev_model, options));
+  }
+
+  if (updates.openrouter_key?.trim()) {
+    const key = updates.openrouter_key.trim();
+    
+    // Check if the user is passing a raw key instead of the {env:...} reference
+    if (!key.startsWith("{env:")) {
+      // 1. Save it to the OS environment permanently
+      await setEnvVarOS("OPENROUTER_API_KEY", key);
+      
+      // 2. Store the environment reference in opencode.jsonc instead of plain text
+      currentText = applyEdits(currentText, modify(currentText, ["provider", "openrouter", "options", "apiKey"], "{env:OPENROUTER_API_KEY}", options));
+    } else {
+      // It's already an env reference, just save it as is
+      currentText = applyEdits(currentText, modify(currentText, ["provider", "openrouter", "options", "apiKey"], key, options));
+    }
+  }
+
+  fs.writeFileSync(configPath, currentText, "utf8");
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +252,7 @@ function renderPanel(config: OpencodeConfig): string {
   </div>
   <form id="configForm">
     <label>OpenRouter API Key
-      <p class="desc">Access key (sk-or-v1-...). The plugin reads this directly from opencode.jsonc to avoid Windows environment variable issues.</p>
+      <p class="desc">Access key (sk-or-v1-...). When saved, this panel will register it directly in your OS environment variables (as OPENROUTER_API_KEY) and store only a reference ({env:OPENROUTER_API_KEY}) in opencode.jsonc to keep your key secure.</p>
       <input type="password" name="openrouter_key" value="${safeKey}" placeholder="sk-or-v1-...">
     </label>
 
@@ -262,9 +314,9 @@ export function startPanel(port = 3040, configDir?: string): void {
     if (req.method === "POST" && req.url === "/save") {
       let body = "";
       req.on("data", (chunk: Buffer) => (body += chunk.toString()));
-      req.on("end", () => {
+      req.on("end", async () => {
         try {
-          saveConfig(configPath, JSON.parse(body) as SavePayload);
+          await saveConfig(configPath, JSON.parse(body) as SavePayload);
           res.writeHead(200);
           res.end("OK");
         } catch (e) {

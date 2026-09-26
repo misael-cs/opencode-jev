@@ -1,6 +1,8 @@
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { spawn } from "child_process";
+import { fileURLToPath } from "url";
 import { buildDynamicCriteria } from "./catalog.js";
 import {
   CONFIG_DIR,
@@ -10,6 +12,8 @@ import {
   readOpencodeConfig,
   parseModelString,
 } from "./utils.js";
+
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // TypeSafe/JEV answer types
@@ -131,6 +135,23 @@ function resolveTargetModel(
   if (score < TRIVIAL_THRESHOLD && smallModel) return { target: "small", modelStr: smallModel };
   if (score > COMPLEX_THRESHOLD && plannerModel) return { target: "planner", modelStr: plannerModel };
   return { target: "core", modelStr: coreModel };
+}
+
+// A provider is usable only if OpenCode can actually serve it: it is either
+// declared in opencode.jsonc or has stored auth. Overriding to an unknown
+// provider makes the LLM call hang, so we fall back to the core model instead.
+function isProviderUsable(providerID: string, config: Record<string, unknown> | null): boolean {
+  const configured = new Set<string>();
+  const provider = config?.provider as Record<string, unknown> | undefined;
+  if (provider) for (const k of Object.keys(provider)) configured.add(k);
+  try {
+    const authPath = path.join(os.homedir(), ".local", "share", "opencode", "auth.json");
+    if (fs.existsSync(authPath)) {
+      const auth = JSON.parse(fs.readFileSync(authPath, "utf8")) as Record<string, unknown>;
+      for (const k of Object.keys(auth)) configured.add(k);
+    }
+  } catch (_) {}
+  return configured.has(providerID);
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +323,7 @@ function extractWords(toolName: string): string[] {
   return words;
 }
 
-export function isToolSafeReadonly(toolName: string): boolean {
+function isToolSafeReadonly(toolName: string): boolean {
   const raw = toolName.trim();
   const lower = raw.toLowerCase();
 
@@ -420,7 +441,7 @@ async function queryJevFailureDetect(
 export default (async (_ctx: unknown) => {
   // Autostart web dashboard silently
   try {
-    const dashboardPath = path.join(__dirname, "dashboard.js");
+    const dashboardPath = path.join(moduleDir, "dashboard.js");
     if (fs.existsSync(dashboardPath)) {
       const p = spawn(process.execPath, [dashboardPath], { detached: true, stdio: "ignore" });
       p.unref();
@@ -528,6 +549,17 @@ export default (async (_ctx: unknown) => {
         const routing = resolveTargetModel(
           complexityScore, complexityConf, smallModel, plannerModel, currentModelStr
         );
+
+        // Guard: never override to a provider OpenCode cannot serve, otherwise
+        // the LLM call hangs waiting for a non-existent provider/model.
+        if (routing.target !== "core") {
+          const parsedTarget = parseModelString(routing.modelStr);
+          if (!parsedTarget || !isProviderUsable(parsedTarget.providerID, config)) {
+            log(`Override skipped: provider "${parsedTarget?.providerID ?? routing.modelStr}" not configured/authorized. Keeping core model.`);
+            routing.target = "core";
+            routing.modelStr = currentModelStr;
+          }
+        }
         log(`Routing → ${routing.target.toUpperCase()} (${routing.modelStr})`);
 
         // Cache decision for system.transform

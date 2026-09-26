@@ -4,9 +4,12 @@ import path from 'path';
 import os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import { fileURLToPath } from 'url';
 import { parse, modify, applyEdits, ModificationOptions } from 'jsonc-parser';
+import SysTrayModule from 'systray2';
 
 const execAsync = promisify(exec);
+const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Cross-platform setup
@@ -30,16 +33,10 @@ const classLogFile = path.join(configDir, 'jev_classifications.jsonl');
 const configPath = path.join(configDir, 'opencode.jsonc');
 
 // ---------------------------------------------------------------------------
-// Auto-shutdown Heartbeat
+// Liveness state (kept for /api/heartbeat; server persists via system tray)
 // ---------------------------------------------------------------------------
 let hasConnected = false;
 let lastHeartbeat = Date.now();
-
-setInterval(() => {
-    const now = Date.now();
-    if (hasConnected && now - lastHeartbeat > 10000) process.exit(0);
-    if (!hasConnected && now - lastHeartbeat > 60000) process.exit(0);
-}, 2000);
 
 const openBrowser = (url: string) => {
     const platform = os.platform();
@@ -69,13 +66,13 @@ function saveJevState(state: any) {
 interface ModelEntry { id: string; name: string; provider: string; }
 
 const BUILTIN_MODELS: ModelEntry[] = [
-  { id: "opencodezen/Ling-3.0-Flash-Fin", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/MiMo-V2.6-Flash", name: "MiMo-V2.6-Flash Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Muse-Spark-1.2", name: "Muse Spark 1.2 Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Muse-Spark-1.3", name: "Muse Spark 1.3 Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Nemotron-3-Ultra", name: "Nemotron 3 Ultra Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Nemotron-3.5-Lightning", name: "Nemotron 3.5 Lightning Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Space-Bunny", name: "Space Bunny Free", provider: "OpenCode Zen" },
+  { id: "opencode/ling-3.0-flash-fin-free", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
+  { id: "opencode/mimo-v2.6-flash-free", name: "MiMo-V2.6-Flash Free", provider: "OpenCode Zen" },
+  { id: "opencode/muse-spark-1.2", name: "Muse Spark 1.2 Free", provider: "OpenCode Zen" },
+  { id: "opencode/muse-spark-1.3", name: "Muse Spark 1.3 Free", provider: "OpenCode Zen" },
+  { id: "opencode/nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free", provider: "OpenCode Zen" },
+  { id: "opencode/nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning Free", provider: "OpenCode Zen" },
+  { id: "opencode/space-bunny-free", name: "Space Bunny Free", provider: "OpenCode Zen" },
 ];
 
 function readConfig(): any {
@@ -91,6 +88,33 @@ function getAvailableModels(config: any): ModelEntry[] {
   const disabled = config.disabled_providers ?? [];
   const dynamic: ModelEntry[] = [];
 
+  // 1. Ler modelos ativos/visíveis do OpenCode Desktop UI (opencode.global.dat)
+  try {
+    const globalDatPath = path.join(os.homedir(), "AppData", "Roaming", "ai.opencode.desktop", "opencode.global.dat");
+    if (fs.existsSync(globalDatPath)) {
+      const rawGlobal = fs.readFileSync(globalDatPath, "utf8");
+      const parsedGlobal = JSON.parse(rawGlobal);
+      if (parsedGlobal.model) {
+        const modelState = JSON.parse(parsedGlobal.model);
+        if (modelState.user && Array.isArray(modelState.user)) {
+          for (const u of modelState.user) {
+            if (u.visibility === "show" && !disabled.includes(u.providerID)) {
+              const niceProv = u.providerID.charAt(0).toUpperCase() + u.providerID.slice(1);
+              dynamic.push({
+                id: `${u.providerID}/${u.modelID}`,
+                name: `${u.modelID} (${niceProv})`,
+                provider: niceProv,
+              });
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Erro ao ler modelos do OpenCode Desktop:", e);
+  }
+
+  // 2. Modelo estático / customizado configurado no opencode.jsonc
   if (config.provider) {
     for (const [prov, provData] of Object.entries(config.provider)) {
       if (disabled.includes(prov)) continue;
@@ -98,25 +122,28 @@ function getAvailableModels(config: any): ModelEntry[] {
       if (pd.models) {
         for (const [modId, modData] of Object.entries(pd.models)) {
           const niceProv = prov.charAt(0).toUpperCase() + prov.slice(1);
-          dynamic.push({
-            id: `${prov}/${modId}`,
-            name: (modData as any).name ?? modId,
-            provider: niceProv,
-          });
+          const fullId = `${prov}/${modId}`;
+          if (!dynamic.find((x) => x.id === fullId)) {
+            dynamic.push({
+              id: fullId,
+              name: (modData as any).name ?? modId,
+              provider: niceProv,
+            });
+          }
         }
       }
     }
   }
 
-  const all = [...BUILTIN_MODELS];
-  for (const m of dynamic) {
+  const all = [...dynamic];
+  for (const m of BUILTIN_MODELS) {
     if (!all.find((x) => x.id === m.id)) all.push(m);
   }
 
   const currentModels = [config.small_model, config.agent?.plan?.model];
   for (const m of currentModels) {
     if (m && !all.find((x) => x.id === m || `${x.id}-Free` === m)) {
-      all.push({ id: m, name: `${m} (implicit/external)`, provider: "Other" });
+      all.push({ id: m, name: `${m} (implícito/externo)`, provider: "Outros" });
     }
   }
 
@@ -311,20 +338,20 @@ const html = `<!DOCTYPE html>
                         <div class="text-xs text-gray-500 mb-2" x-text="item.timestamp"></div>
                         <div class="mb-3">
                             <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">Input Context</span>
-                            <div class="mt-1 bg-black text-gray-300 p-3 rounded font-serif text-sm border border-gray-800 whitespace-pre-wrap" x-text="item.requestContext"></div>
+                            <div class="mt-1 bg-black text-gray-300 p-3 rounded font-serif text-sm border border-gray-800 whitespace-pre-wrap" x-text="item.request || item.tool || ''"></div>
                         </div>
                         <div>
                             <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">JEV Decision</span>
                             <div class="mt-1 flex flex-wrap gap-6 bg-gray-950 p-3 rounded border border-gray-800 text-sm">
                                 <div>
                                     <span class="text-gray-500">Domain:</span> 
-                                    <span class="font-bold text-emerald-400" x-text="item.response.next_tool_domain?.choice || 'N/A'"></span>
-                                    <span class="text-xs text-gray-500" x-text="'(conf: ' + (item.response.next_tool_domain?.confidence || 'N/A') + ')'"></span>
+                                    <span class="font-bold text-emerald-400" x-text="item.domain || 'N/A'"></span>
+                                    <span class="text-xs text-gray-500" x-text="'(conf: ' + (item.domainConf ?? 'N/A') + ')'"></span>
                                 </div>
-                                <div x-show="item.response.task_complexity">
+                                <div x-show="item.complexityScore !== undefined">
                                     <span class="text-gray-500">Complexity:</span> 
-                                    <span class="font-bold text-amber-400" x-text="item.response.task_complexity?.choice || 'N/A'"></span>
-                                    <span class="text-xs text-gray-500" x-text="'(conf: ' + (item.response.task_complexity?.confidence || 'N/A') + ')'"></span>
+                                    <span class="font-bold text-amber-400" x-text="item.complexityScore ?? 'N/A'"></span>
+                                    <span class="text-xs text-gray-500" x-text="'(conf: ' + (item.complexityConf ?? 'N/A') + ')'"></span>
                                 </div>
                             </div>
                         </div>
@@ -627,11 +654,10 @@ const html = `<!DOCTYPE html>
                         content = this.filteredLogs.map(l => l.raw).join('\\n');
                         filename = 'jev_advanced_logs.txt';
                     } else {
-                        content = this.filteredClassifications.map(c => JSON.stringify({
-                            timestamp: c.timestamp,
-                            requestContext: c.requestContext,
-                            response: c.response
-                        })).join('\\n');
+                        content = this.filteredClassifications.map(c => {
+                            const { id, ...rest } = c;
+                            return JSON.stringify(rest);
+                        }).join('\\n');
                         filename = 'jev_classifications.jsonl';
                     }
                     
@@ -869,4 +895,89 @@ server.on('error', (e: any) => {
 server.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
     openBrowser(`http://localhost:${port}`);
+    startSystemTray();
 });
+
+// ---------------------------------------------------------------------------
+// System Tray — keeps the server alive and gives quick access
+// ---------------------------------------------------------------------------
+function resolveIconPath(): string | null {
+    const candidates = [
+        path.join(moduleDir, '..', '..', 'assets', 'jev_icon.ico'),
+        path.join(configDir, 'jev_icon.ico'),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return null;
+}
+
+function startSystemTray(): void {
+    try {
+        const iconPath = resolveIconPath();
+        if (!iconPath) {
+            console.error('System Tray: jev_icon.ico not found; tray disabled.');
+            return;
+        }
+        const iconData = fs.readFileSync(iconPath).toString('base64');
+        const SysTray = (SysTrayModule as any).default ?? SysTrayModule;
+
+        let systray: any;
+
+        const itemOpen: any = {
+            title: "Abrir Dashboard",
+            tooltip: "Abre o painel no navegador",
+            checked: false,
+            enabled: true,
+            click: () => openBrowser(`http://localhost:${port}`),
+        };
+        const itemToggle: any = {
+            title: "Ligar/Desligar JEV",
+            tooltip: "Alterna o estado do interceptador",
+            checked: false,
+            enabled: true,
+            click: () => {
+                const s = getJevState();
+                s.enabled = !s.enabled;
+                saveJevState(s);
+                itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
+                systray.sendAction({ type: 'update-item', item: itemToggle });
+            },
+        };
+        const itemExit: any = {
+            title: "Encerrar Servidor",
+            tooltip: "Fecha definitivamente o servidor JEV",
+            checked: false,
+            enabled: true,
+            click: () => {
+                systray.kill();
+                setTimeout(() => process.exit(0), 500);
+            },
+        };
+
+        systray = new SysTray({
+            menu: {
+                icon: iconData,
+                title: "JEV Dashboard",
+                tooltip: "JEV Control Center",
+                items: [itemOpen, itemToggle, itemExit],
+            },
+            debug: false,
+            copyDir: true,
+        });
+
+        systray.onClick((action: any) => {
+            if (action.item.click != null) action.item.click();
+        });
+
+        systray.ready()
+            .then(() => {
+                const s = getJevState();
+                itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
+                systray.sendAction({ type: 'update-item', item: itemToggle });
+            })
+            .catch((err: any) => console.error('Falha ao iniciar System Tray:', err));
+    } catch (err) {
+        console.error('Erro no setup do System Tray:', (err as Error).message);
+    }
+}

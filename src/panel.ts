@@ -147,18 +147,43 @@ async function saveConfig(configPath: string, updates: SavePayload): Promise<voi
 // ---------------------------------------------------------------------------
 
 const BUILTIN_MODELS: ModelEntry[] = [
-  { id: "opencodezen/Ling-3.0-Flash-Fin", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/MiMo-V2.6-Flash", name: "MiMo-V2.6-Flash Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Muse-Spark-1.2", name: "Muse Spark 1.2 Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Muse-Spark-1.3", name: "Muse Spark 1.3 Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Nemotron-3-Ultra", name: "Nemotron 3 Ultra Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Nemotron-3.5-Lightning", name: "Nemotron 3.5 Lightning Free", provider: "OpenCode Zen" },
-  { id: "opencodezen/Space-Bunny", name: "Space Bunny Free", provider: "OpenCode Zen" },
+  { id: "opencode/ling-3.0-flash-fin-free", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
+  { id: "opencode/mimo-v2.6-flash-free", name: "MiMo-V2.6-Flash Free", provider: "OpenCode Zen" },
+  { id: "opencode/muse-spark-1.2", name: "Muse Spark 1.2 Free", provider: "OpenCode Zen" },
+  { id: "opencode/muse-spark-1.3", name: "Muse Spark 1.3 Free", provider: "OpenCode Zen" },
+  { id: "opencode/nemotron-3-ultra-free", name: "Nemotron 3 Ultra Free", provider: "OpenCode Zen" },
+  { id: "opencode/nemotron-3.5-lightning-free", name: "Nemotron 3.5 Lightning Free", provider: "OpenCode Zen" },
+  { id: "opencode/space-bunny-free", name: "Space Bunny Free", provider: "OpenCode Zen" },
 ];
 
 function getAvailableModels(config: OpencodeConfig): ModelEntry[] {
   const disabled = config.disabled_providers ?? [];
   const dynamic: ModelEntry[] = [];
+
+  try {
+    const globalDatPath = path.join(os.homedir(), "AppData", "Roaming", "ai.opencode.desktop", "opencode.global.dat");
+    if (fs.existsSync(globalDatPath)) {
+      const rawGlobal = fs.readFileSync(globalDatPath, "utf8");
+      const parsedGlobal = JSON.parse(rawGlobal);
+      if (parsedGlobal.model) {
+        const modelState = JSON.parse(parsedGlobal.model);
+        if (modelState.user && Array.isArray(modelState.user)) {
+          for (const u of modelState.user) {
+            if (u.visibility === "show" && !disabled.includes(u.providerID)) {
+              const niceProv = u.providerID.charAt(0).toUpperCase() + u.providerID.slice(1);
+              dynamic.push({
+                id: `${u.providerID}/${u.modelID}`,
+                name: `${u.modelID} (${niceProv})`,
+                provider: niceProv,
+              });
+            }
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Erro ao ler modelos do OpenCode Desktop:", e);
+  }
 
   if (config.provider) {
     for (const [prov, provData] of Object.entries(config.provider)) {
@@ -166,18 +191,21 @@ function getAvailableModels(config: OpencodeConfig): ModelEntry[] {
       if (provData.models) {
         for (const [modId, modData] of Object.entries(provData.models)) {
           const niceProv = prov.charAt(0).toUpperCase() + prov.slice(1);
-          dynamic.push({
-            id: `${prov}/${modId}`,
-            name: modData.name ?? modId,
-            provider: niceProv,
-          });
+          const fullId = `${prov}/${modId}`;
+          if (!dynamic.find((x) => x.id === fullId)) {
+            dynamic.push({
+              id: fullId,
+              name: modData.name ?? modId,
+              provider: niceProv,
+            });
+          }
         }
       }
     }
   }
 
-  const all = [...BUILTIN_MODELS];
-  for (const m of dynamic) {
+  const all = [...dynamic];
+  for (const m of BUILTIN_MODELS) {
     if (!all.find((x) => x.id === m.id)) all.push(m);
   }
 
@@ -185,7 +213,7 @@ function getAvailableModels(config: OpencodeConfig): ModelEntry[] {
   const currentModels = [config.small_model, config.agent?.plan?.model];
   for (const m of currentModels) {
     if (m && !all.find((x) => x.id === m || `${x.id}-Free` === m)) {
-      all.push({ id: m, name: `${m} (implicit/external)`, provider: "Other" });
+      all.push({ id: m, name: `${m} (implícito/externo)`, provider: "Outros" });
     }
   }
 

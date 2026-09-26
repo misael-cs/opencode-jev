@@ -31,6 +31,23 @@ This updates a persistent file in the workspace (`.opencode/jev_context.md`) tha
 ### 4. Dynamic MCP Routing
 JEV dynamically parses your `opencode.jsonc` file to discover installed MCP (Model Context Protocol) servers. It cross-references them with a rich internal semantic catalog (`obsidian`, `postgres`, `github`, `puppeteer`, etc.) and automatically routes intents to external technologies with zero hardcoding.
 
+### 5. Polyvalent LLM Guardrails (Pre-Execution Safety)
+Every tool call — built-in (`bash`, `write`, `edit`), MCP tools (Hostinger, VPS, DNS, databases), or any custom tool — passes through a semantic `noul` check **before executing**:
+
+> *"Could this tool call cause data loss, modify or delete production systems, expose credentials, or perform an irreversible destructive action?"*
+
+- Tools with unambiguously read-only names (`listWebsitesV1`, `getDNSRecords`, `search-vault`) skip the check to save latency.
+- Compound traps (`get_or_create`, `search-and-replace`) and hidden mutations are always checked.
+- Default behavior: **log only** (detections are written to `jev_classifications.jsonl`).
+- Opt-in hard blocking: enable **Guardrail Bloqueante** in the web panel to `throw` before destructive tools run.
+
+### 6. Reactive Mid-Loop Escalation (Harness Engineering)
+After every tool execution, JEV classifies the output:
+
+> *"Does this tool output indicate an error, failure, or unexpected result?"*
+
+Consecutive failures (default: 2) trip a per-session escalation flag. On the very next turn, the orchestrator **forces the Strategic Planner model** regardless of the initial complexity score — then resets. This is the canonical TypeSafe pattern applied to the AGENTS.md *Mid-Loop Escalation* policy: failures detected at lightspeed, escalation only when the executor is actually stuck.
+
 ---
 
 ## Prerequisites
@@ -82,20 +99,23 @@ JEV evaluates the context against core domains + your installed MCPs:
 | `OS_EXECUTION` | Run shell commands, scripts, containers |
 | `WEB_AUTOMATION` | Browser control (Playwright), scraping, testing |
 | `KNOWLEDGE_RETRIEVAL` | Obsidian, web search, documentation |
-| `INFRA_MANAGEMENT` | VPS, DNS, Hostinger, domain management |
 | `WORKFLOW_CONTROL` | TODOs, sub-agents, asking the user questions |
 | `FINAL_ANSWER` | Prose-only responses, no tool needed |
 | `MCP_*` | Dynamically generated based on your installed MCP servers |
 
 ## Debug Log
 
-All hook activity, classifications, and dynamic model swaps are logged to:
+All hook activity, classifications, guardrail detections, failure escalations, and model swaps are logged to:
 - **Windows:** `%APPDATA%\opencode\jev_debug.log`
 - **Linux/macOS:** `~/.config/opencode/jev_debug.log`
+
+Structured classifications (routing, guardrail, failure) are appended to `~/.config/opencode/jev_classifications.jsonl`.
 
 ## Resiliency Architecture
 
 - **Fail-Safe Bypasses:** If JEV confidence falls below 60%, if the OpenRouter API goes offline, or if rate limits are hit, the plugin fails silently and transparently passes execution back to the Core LLM to maintain standard OpenCode behavior without disruption.
+- **Fail-Open Guardrails:** If the guardrail check itself fails (network, timeout), the tool call proceeds. The guardrail never blocks silently due to infrastructure failure.
+- **Conservative Skip-List:** The read-only skip-list only skips tools whose names are unambiguously reads. Anything ambiguous or compound is always checked by JEV.
 - **Strict JSONC Parsing:** The plugin uses Microsoft's `jsonc-parser` to inject variables via AST without removing your custom comments, formatting, or breaking existing configuration files.
 
 ## License

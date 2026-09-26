@@ -1,44 +1,33 @@
 import fs from "fs";
 import path from "path";
-import { parse } from "jsonc-parser";
-import os from "os";
+import { resolveApiKey } from "./utils.js";
 
-// Helper to get API key (similar to plugin.ts)
-function getOpencodeConfigDir(): string {
-  const xdg = process.env.XDG_CONFIG_HOME;
-  return xdg ? path.join(xdg, "opencode") : path.join(os.homedir(), ".config", "opencode");
+// ---------------------------------------------------------------------------
+// TypeSafe/JEV API — noul query
+// A Noul returns the probability (0–1) that a yes/no statement is true.
+// This is the correct primitive for binary relevance checks, per the docs:
+// "Use a Noul when the answer is yes or no."
+// ---------------------------------------------------------------------------
+
+interface NoulAnswer {
+  type: "noul";
+  noul: number; // 0.0 (no) to 1.0 (yes)
 }
 
-function resolveApiKey(): string | undefined {
-  const envKey = process.env.OPENROUTER_API_KEY;
-  if (envKey) return envKey;
-
-  try {
-    const configPath = path.join(getOpencodeConfigDir(), "opencode.jsonc");
-    if (fs.existsSync(configPath)) {
-      const raw = fs.readFileSync(configPath, "utf8");
-      const config = parse(raw) as Record<string, unknown>;
-      const provider = config?.provider as Record<string, unknown> | undefined;
-      const openrouter = provider?.openrouter as Record<string, unknown> | undefined;
-      const options = openrouter?.options as Record<string, unknown> | undefined;
-      const key = options?.apiKey as string | undefined;
-      
-      if (key) {
-        if (key.startsWith("{env:") && key.endsWith("}")) {
-          const envName = key.slice(5, -1);
-          return process.env[envName];
-        }
-        return key;
-      }
-    }
-  } catch (e) {
-    // ignore
-  }
-
-  return undefined;
+interface NoulResponse {
+  answers: {
+    is_relevant?: NoulAnswer;
+  };
 }
 
-async function askJev(apiKey: string, question: string, contextString: string): Promise<boolean> {
+// Threshold: file is considered a match when relevance probability > 0.72
+const NOUL_RELEVANCE_THRESHOLD = 0.72;
+
+async function askJev(
+  apiKey: string,
+  query: string,
+  fileContent: string
+): Promise<number> {
   try {
     const response = await fetch("https://openrouter.ai/api/alpha/decisions", {
       method: "POST",
@@ -48,109 +37,153 @@ async function askJev(apiKey: string, question: string, contextString: string): 
       },
       body: JSON.stringify({
         model: "typesafe/jev-1.13",
+        // Structured state: separate content from the query per TypeSafe docs
+        state: {
+          file_content: fileContent.substring(0, 32000),
+          search_query: query,
+        },
         questions: {
-          contains_answer: {
-            type: "choice",
-            instructions: `Does the provided text contain the answer to or match the intent of the following query? Query: "${question}"`,
+          is_relevant: {
+            type: "noul",
+            instructions:
+              "Does the file_content contain information that answers, matches, or is directly relevant to the search_query?",
             criteria: {
-              YES: "The text clearly contains information that answers the query, or is highly relevant to it.",
-              NO: "The text does not contain the answer, or is completely unrelated.",
+              true: "The file contains code, configuration, documentation, or data that directly relates to or answers the search_query.",
+              false: "The file does not contain relevant information for the search_query, or the content is completely unrelated.",
             },
           },
         },
-        state: { context: contextString.substring(0, 32000) }, // Limit to prevent payload too large
       }),
     });
 
-    if (!response.ok) return false;
-    
-    const data = await response.json() as any;
-    const answer = data?.answers?.contains_answer;
-    
-    if (answer && answer.choice === "YES" && typeof answer.confidence === "number" && answer.confidence > 0.6) {
-      return true;
+    if (!response.ok) return 0;
+
+    const data = (await response.json()) as NoulResponse;
+    const answer = data?.answers?.is_relevant;
+
+    // Return the raw probability — caller decides threshold
+    if (answer && answer.type === "noul" && typeof answer.noul === "number") {
+      return answer.noul;
     }
-  } catch (err) {
-    // Silent fail for individual chunks
+  } catch (_) {
+    // Silent fail for individual file checks
   }
-  return false;
+  return 0;
 }
+
+// ---------------------------------------------------------------------------
+// File tree traversal
+// ---------------------------------------------------------------------------
+
+const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "build", "__pycache__", ".venv", "venv"]);
+const BINARY_EXTS = new Set([
+  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+  ".pdf", ".zip", ".tar", ".gz", ".7z", ".rar",
+  ".mp4", ".mp3", ".wav", ".avi", ".mov",
+  ".exe", ".dll", ".so", ".dylib", ".bin",
+  ".woff", ".woff2", ".ttf", ".eot",
+]);
 
 function getFilesRecursively(dir: string, fileList: string[] = []): string[] {
   if (!fs.existsSync(dir)) return fileList;
-  
+
   const stat = fs.statSync(dir);
   if (stat.isFile()) {
     fileList.push(dir);
     return fileList;
   }
-  
-  const files = fs.readdirSync(dir);
-  for (const file of files) {
-    const filePath = path.join(dir, file);
-    // Skip common heavy directories
-    if (file === "node_modules" || file === ".git" || file === "dist") continue;
-    if (fs.statSync(filePath).isDirectory()) {
-      getFilesRecursively(filePath, fileList);
-    } else {
-      // Only process likely text files based on extension, or files with no extension
-      const ext = path.extname(filePath).toLowerCase();
-      const binaryExts = ['.png', '.jpg', '.jpeg', '.gif', '.pdf', '.zip', '.tar', '.gz', '.mp4', '.exe', '.dll'];
-      if (!binaryExts.includes(ext)) {
-        fileList.push(filePath);
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch (_) {
+    return fileList;
+  }
+
+  for (const entry of entries) {
+    if (SKIP_DIRS.has(entry)) continue;
+
+    const fullPath = path.join(dir, entry);
+    let entryStat: fs.Stats;
+    try {
+      entryStat = fs.statSync(fullPath);
+    } catch (_) {
+      continue;
+    }
+
+    if (entryStat.isDirectory()) {
+      getFilesRecursively(fullPath, fileList);
+    } else if (entryStat.isFile()) {
+      const ext = path.extname(fullPath).toLowerCase();
+      if (!BINARY_EXTS.has(ext)) {
+        fileList.push(fullPath);
       }
     }
   }
+
   return fileList;
 }
 
-export async function runScan(question: string, targetPath: string): Promise<void> {
+// ---------------------------------------------------------------------------
+// Main scan function
+// ---------------------------------------------------------------------------
+
+const MAX_FILE_SIZE = 500_000; // ~500KB
+const BATCH_SIZE = 5;
+const MAX_MATCHES = 3;
+
+export async function runScan(query: string, targetPath: string): Promise<void> {
   const apiKey = resolveApiKey();
   if (!apiKey) {
-    console.error("Error: OpenRouter API key not found. Please configure it using `opencode-jev panel`.");
+    console.error(
+      "Error: OpenRouter API key not found. Configure it with `opencode-jev panel`."
+    );
     process.exit(1);
   }
 
   const absolutePath = path.resolve(process.cwd(), targetPath);
-  console.log(`Scanning path: ${absolutePath}`);
-  console.log(`Looking for: "${question}"\n`);
-  
+  console.log(`Scanning: ${absolutePath}`);
+  console.log(`Query:    "${query}"\n`);
+
   const files = getFilesRecursively(absolutePath);
+  console.log(`Files to scan: ${files.length}`);
+
   let foundMatches = 0;
 
-  // We can process in batches to not overwhelm the API
-  const BATCH_SIZE = 5;
-  
   for (let i = 0; i < files.length; i += BATCH_SIZE) {
     const batch = files.slice(i, i + BATCH_SIZE);
-    
+
     const promises = batch.map(async (file) => {
       try {
+        const stat = fs.statSync(file);
+        if (stat.size > MAX_FILE_SIZE) return null;
+
         const content = fs.readFileSync(file, "utf8");
-        // Skip huge minified files
-        if (content.length > 500000) return null;
-        
-        const isMatch = await askJev(apiKey, question, content);
-        if (isMatch) {
-          return file;
+        const probability = await askJev(apiKey, query, content);
+
+        if (probability >= NOUL_RELEVANCE_THRESHOLD) {
+          return { file, probability };
         }
-      } catch (e) {
-        // e.g. file reading errors due to binary content
+      } catch (_) {
+        // skip unreadable files
       }
       return null;
     });
 
     const results = await Promise.all(promises);
+
     for (const res of results) {
       if (res) {
-        console.log(`[MATCH FOUND] -> ${res}`);
+        const pct = (res.probability * 100).toFixed(0);
+        console.log(`[MATCH ${pct}%] ${res.file}`);
         foundMatches++;
       }
     }
-    
-    // Stop early if we found enough matches to give to the LLM (e.g. 3)
-    if (foundMatches >= 3) {
-      console.log(`\nStopping scan early as ${foundMatches} matches were found. Read these files to continue.`);
+
+    if (foundMatches >= MAX_MATCHES) {
+      console.log(
+        `\nStopped early: ${foundMatches} matches found. Read these files to continue.`
+      );
       return;
     }
   }

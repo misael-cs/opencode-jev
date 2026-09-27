@@ -200,8 +200,8 @@ async function uninstall(): Promise<void> {
 async function panel(): Promise<void> {
   const portArg = process.argv[3];
   const port = portArg ? parseInt(portArg, 10) : 3040;
-  const { startPanel } = await import("../src/panel.js");
-  startPanel(port);
+  const { startDashboard } = await import("../src/dashboard.js");
+  startDashboard(port);
 }
 
 // ---------------------------------------------------------------------------

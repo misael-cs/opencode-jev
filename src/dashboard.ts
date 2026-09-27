@@ -14,7 +14,7 @@ const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 // Cross-platform setup
 // ---------------------------------------------------------------------------
-const port = 19999;
+let port = 19999;
 
 function getOpencodeConfigDir(): string {
   if (process.platform === "win32") {
@@ -1005,11 +1005,16 @@ server.on('error', (e: any) => {
     }
 });
 
-server.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-    openBrowser(`http://localhost:${port}`);
-    startSystemTray();
-});
+// Entry point used by bin/cli.ts (`opencode-jev panel`). Keeps the dashboard
+// importable without side effects and lets the caller choose the port.
+export function startDashboard(portArg = 19999): void {
+    port = portArg;
+    server.listen(port, () => {
+        console.log(`JEV Dashboard running at http://localhost:${port}`);
+        openBrowser(`http://localhost:${port}`);
+        startSystemTray();
+    });
+}
 
 // ---------------------------------------------------------------------------
 // System Tray — keeps the server alive and gives quick access

@@ -3,7 +3,6 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import readline from "readline";
-import { fileURLToPath } from "url";
 import { parse, modify, applyEdits, ModificationOptions } from "jsonc-parser";
 
 // ---------------------------------------------------------------------------
@@ -141,26 +140,13 @@ async function install(): Promise<void> {
   fs.writeFileSync(configPath, currentConfigText, "utf8");
   console.log(`[✓] opencode.jsonc updated.`);
 
-  // 5. Copy agent/jev.md
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const agentSrc = path.join(__dirname, "..", "agent", "jev.md");
-  const agentDest = path.join(agentDir, "jev.md");
-
-  if (!fs.existsSync(agentDir)) {
-    fs.mkdirSync(agentDir, { recursive: true });
-  }
-
-  if (fs.existsSync(agentSrc)) {
-    fs.copyFileSync(agentSrc, agentDest);
-    console.log(`[✓] agent/jev.md installed to ${agentDest}`);
-  } else {
-    // Fallback: write inline if package structure differs
-    fs.writeFileSync(
-      agentDest,
-      `---\nname: Jev\ndescription: Activates JEV intra-loop routing in background (O(1) latency).\nmode: primary\n---\n[JEV_ORCHESTRATOR_ENABLED]\nYou are the Core Worker guided by JEV. Wait for the classifier injection before invoking the exact tool.\n`,
-      "utf8"
-    );
-    console.log(`[✓] agent/jev.md written to ${agentDest}`);
+  // 5. Remove stale legacy agent file (agent/jev.md from pre-plugin-gated
+  //    installs). Current activation is governed by jev_state.json
+  //    (`opencode-jev` dashboard toggle), no custom agent is required.
+  const staleAgent = path.join(agentDir, "jev.md");
+  if (fs.existsSync(staleAgent)) {
+    fs.unlinkSync(staleAgent);
+    console.log(`[✓] Removed legacy agent file ${staleAgent} (no longer needed).`);
   }
 
   console.log(`
@@ -168,8 +154,8 @@ Installation complete.
 
 Next steps:
   1. Restart OpenCode.
-  2. Press Ctrl+O and select the "Jev" agent to enable routing.
-  3. Run \`opencode-jev panel\` to manage auxiliary models.
+  2. Run \`opencode-jev\` to open the JEV Control Center and enable the orchestrator (Master Switch).
+  3. Configure models in the Settings tab (Harvester, Text Generator, Planning and Coding variants).
 `);
 }
 
@@ -182,7 +168,7 @@ async function uninstall(): Promise<void> {
   const configPath = path.join(configDir, "opencode.jsonc");
   const agentPath = path.join(getOpencodeAgentDir(), "jev.md");
 
-  const confirm = await prompt("Remove JEV plugin from opencode.jsonc and delete agent? [y/N]: ");
+  const confirm = await prompt("Remove JEV plugin from opencode.jsonc? [y/N]: ");
   if (confirm.trim().toLowerCase() !== "y") {
     console.log("Aborted.");
     return;
@@ -198,9 +184,10 @@ async function uninstall(): Promise<void> {
     console.log(`[✓] Removed "@misaelcs/opencode-jev" from plugin array.`);
   }
 
+  // Legacy cleanup: old builds installed agent/jev.md
   if (fs.existsSync(agentPath)) {
     fs.unlinkSync(agentPath);
-    console.log(`[✓] Deleted ${agentPath}`);
+    console.log(`[✓] Deleted legacy agent file ${agentPath}`);
   }
 
   console.log("Uninstall complete. Restart OpenCode to apply.");

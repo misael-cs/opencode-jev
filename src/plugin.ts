@@ -20,7 +20,8 @@ const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 // Using the correct primitives per docs:
 //   choice  → fixed-set routing (tool domain)
 //   score   → ordered rubric (complexity)
-//   noul    → probability of yes/no (guardrail checks, failure detection)
+//   noul    → probability of yes/no (guardrail checks, failure detection,
+//             wrap-up audit)
 // ---------------------------------------------------------------------------
 
 interface JevChoiceAnswer {
@@ -54,83 +55,170 @@ interface JevResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Per-session JEV decision cache
-// Populated by chat.message → consumed by experimental.chat.system.transform.
-// Both hooks fire sequentially per turn.
+// Constants — sentinel protocol + thresholds
 // ---------------------------------------------------------------------------
 
-interface JevDecision {
-  domain: string;
-  domainConfidence: number;
-  complexityScore: number;       // 0.0 = trivial → 1.0 = standard → 2.0 = complex
-  complexityConfidence: number;
-  targetModel: "small" | "core" | "planner";
-  targetModelStr: string;
-  timestamp: number;
-}
+// Completion sentinel: the executor model emits ONLY this token when the whole
+// task is done. Detection is a strict whole-message match (free, deterministic).
+const TASK_COMPLETE_TOKEN = "[TAREFA_FINALIZADA]";
 
-const sessionDecisionCache = new Map<string, JevDecision>();
+const WRAPUP_MARKER = "[JEV WRAP-UP]";
 
-// ---------------------------------------------------------------------------
-// Per-session guardrail state
-// Tracks consecutive tool failures for reactive mid-loop escalation.
-// This is the canonical "Harness Engineering" pattern from TypeSafe docs:
-// "classify agent traces at lightspeed" + "detect errors in real time"
-// ---------------------------------------------------------------------------
+const WRAPUP_TRIGGER_TEXT =
+  `${WRAPUP_MARKER} The engineering work for this task has been completed and verified by JEV. ` +
+  `Write the final user-facing report now: summarize what was done, which files were changed, ` +
+  `which commands were run, and the results. Use clear, well-formatted Markdown ` +
+  `(tables or HTML when they improve visualization). ` +
+  `Do NOT call any tools. Do NOT modify any files. Do NOT emit the completion token. ` +
+  `Reply with the report only.`;
 
-interface SessionGuardrailState {
-  failureCount: number;           // consecutive failed tool calls
-  lastFailureTimestamp: number;
-  forceEscalate: boolean;         // true → override next turn to planner
-  blockedToolCalls: number;       // total guardrail blocks this session
-}
+const SENTINEL_DIRECTIVE =
+  `[JEV COMPLETION PROTOCOL — MANDATORY]\n` +
+  `When — and only when — the ENTIRE requested task is complete (all files written, all commands ` +
+  `executed, all tests/verifications passed, nothing pending), you MUST end your turn by replying ` +
+  `with ONLY this exact token and absolutely nothing else:\n` +
+  `${TASK_COMPLETE_TOKEN}\n` +
+  `Rules:\n` +
+  `- The token must be the sole content of your reply — no explanations, no summaries, no markdown fences.\n` +
+  `- A low-cost reporting model will write the final report for the user afterwards.\n` +
+  `- NEVER emit the token if any part of the task is incomplete, unverified, or blocked.\n` +
+  `- NEVER emit the token when you need to ask the user a question or request input.`;
 
-const sessionGuardrailState = new Map<string, SessionGuardrailState>();
+const WRAPUP_DIRECTIVE =
+  `[JEV WRAP-UP DIRECTIVE]\n` +
+  `Status: WRAP_UP. The task's engineering work is already complete and was verified by JEV.\n` +
+  `Your ONLY job is to write the final user-facing report from the conversation history: ` +
+  `what was done, files changed, commands run, and results, in clear formatted Markdown.\n` +
+  `Do NOT call any tools. Do NOT modify any files. Do NOT emit the completion token.`;
+
+// Complexity routing thresholds
+// score: 0 (trivial) → 1 (standard) → 2 (complex)
+const TRIVIAL_THRESHOLD = 0.6;
+const COMPLEX_THRESHOLD = 1.5;
 
 const ESCALATION_FAILURE_THRESHOLD = 2;  // failures before forcing planner
 const FAILURE_WINDOW_MS = 5 * 60 * 1000; // reset counter after 5 min idle
 
-function getGuardrailState(sessionID: string): SessionGuardrailState {
-  if (!sessionGuardrailState.has(sessionID)) {
-    sessionGuardrailState.set(sessionID, {
+// ---------------------------------------------------------------------------
+// Unified per-session state (JevSessionContext)
+// Single source of truth captured at chat.message (original intent) and
+// consumed by every other hook. Survives the whole intra-loop reasoning cycle:
+// what the agent loses mid-loop, the plugin keeps.
+// ---------------------------------------------------------------------------
+
+type JevSessionStatus = "NORMAL" | "ESCALATED" | "WRAP_UP";
+
+interface ToolTrace {
+  tool: string;
+  failed: boolean;
+}
+
+interface JevSessionContext {
+  // --- Original intent (captured at first user message, never lost) ---
+  originalRequest: string;
+  currentModelStr: string;
+
+  // --- Routing decision (recomputed on each real user message) ---
+  domain: string;
+  domainConfidence: number;
+  complexityScore: number;        // 0.0 = trivial → 1.0 = standard → 2.0 = complex
+  complexityConfidence: number;
+  targetModel: "small" | "core" | "planner";
+  targetModelStr: string;
+  hasRouting: boolean;
+
+  // --- Guardrail / reactive escalation ---
+  failureCount: number;           // consecutive failed tool calls
+  lastFailureTimestamp: number;
+  forceEscalate: boolean;         // true → next LLM call routes to planner
+  blockedToolCalls: number;       // total guardrail blocks this session
+  recentTools: ToolTrace[];       // last tool calls (context for wrap-up audit)
+
+  // --- Lifecycle ---
+  status: JevSessionStatus;
+  wrapUpActive: boolean;          // wrap-up auto-continue cycle in flight
+  timestamp: number;              // last activity (for pruning)
+}
+
+const sessionContexts = new Map<string, JevSessionContext>();
+
+// Last assistant message text per session (sentinel detection).
+// Updated from chat.message (role=assistant) AND message.updated events —
+// redundant capture paths, whichever the harness fires.
+interface LastAssistantMessage {
+  id: string;
+  text: string;
+  time: number;
+}
+const lastAssistantBySession = new Map<string, LastAssistantMessage>();
+
+function getContext(sessionID: string): JevSessionContext {
+  let ctx = sessionContexts.get(sessionID);
+  if (!ctx) {
+    ctx = {
+      originalRequest: "",
+      currentModelStr: "",
+      domain: "",
+      domainConfidence: 0,
+      complexityScore: 1.0,
+      complexityConfidence: 0,
+      targetModel: "core",
+      targetModelStr: "",
+      hasRouting: false,
       failureCount: 0,
       lastFailureTimestamp: 0,
       forceEscalate: false,
       blockedToolCalls: 0,
-    });
+      recentTools: [],
+      status: "NORMAL",
+      wrapUpActive: false,
+      timestamp: Date.now(),
+    };
+    sessionContexts.set(sessionID, ctx);
   }
-  return sessionGuardrailState.get(sessionID)!;
+  ctx.timestamp = Date.now();
+  return ctx;
+}
+
+function recordToolTrace(sessionID: string, tool: string, failed: boolean): void {
+  const ctx = getContext(sessionID);
+  ctx.recentTools.push({ tool, failed });
+  if (ctx.recentTools.length > 10) ctx.recentTools.shift();
 }
 
 function pruneCache(): void {
   const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const [k, v] of sessionDecisionCache) {
-    if (v.timestamp < cutoff) sessionDecisionCache.delete(k);
+  for (const [k, v] of sessionContexts) {
+    if (v.timestamp < cutoff) sessionContexts.delete(k);
   }
-  // Also prune sessions with old failures
-  for (const [k, v] of sessionGuardrailState) {
+  for (const [k, v] of lastAssistantBySession) {
+    if (v.time < cutoff) lastAssistantBySession.delete(k);
+  }
+  // Also prune sessions with stale failures
+  for (const v of sessionContexts.values()) {
     if (v.lastFailureTimestamp > 0 && Date.now() - v.lastFailureTimestamp > FAILURE_WINDOW_MS) {
       v.failureCount = 0;
       v.forceEscalate = false;
+      if (v.status === "ESCALATED") v.status = "NORMAL";
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// Complexity routing thresholds
-// score: 0 (trivial) → 1 (standard) → 2 (complex)
+// Model routing helpers
 // ---------------------------------------------------------------------------
-
-const TRIVIAL_THRESHOLD = 0.6;
-const COMPLEX_THRESHOLD = 1.5;
 
 function resolveTargetModel(
   score: number,
   confidence: number,
   smallModel: string,
   plannerModel: string,
-  coreModel: string
+  codingModel: string,
+  sessionModel: string
 ): { target: "small" | "core" | "planner"; modelStr: string } {
+  // Coding variant of the heavy model — governs the CORE executor when
+  // configured; falls back to the session's model otherwise.
+  const coreModel = codingModel || sessionModel;
   if (confidence < 0.35) return { target: "core", modelStr: coreModel };
   if (score < TRIVIAL_THRESHOLD && smallModel) return { target: "small", modelStr: smallModel };
   if (score > COMPLEX_THRESHOLD && plannerModel) return { target: "planner", modelStr: plannerModel };
@@ -435,10 +523,302 @@ async function queryJevFailureDetect(
 }
 
 // ---------------------------------------------------------------------------
+// JEV query: wrap-up audit (called from session.idle, after sentinel detection)
+// Auditor layer against premature completion signals: the sentinel token is the
+// cheap primary trigger; this noul double-checks it before de-escalating.
+// ---------------------------------------------------------------------------
+
+async function queryJevWrapUpAudit(
+  apiKey: string,
+  ctx: JevSessionContext
+): Promise<{ isComplete: number } | null> {
+  const state = {
+    user_request: ctx.originalRequest.substring(0, 1500),
+    agent_signal: TASK_COMPLETE_TOKEN,
+    recent_tools: ctx.recentTools.map((t) => `${t.tool}:${t.failed ? "fail" : "ok"}`),
+    consecutive_failures: ctx.failureCount,
+  };
+
+  const answers = await jevRequest(apiKey, state, {
+    task_fully_complete: {
+      type: "noul",
+      instructions:
+        "The executor agent has just signaled that the requested task is fully finished. Based on the original request, recent tool activity, and failure count, is the task genuinely complete?",
+      criteria: {
+        true: "The original user request has been fully satisfied: required changes or outputs were produced, verifications succeeded, recent tools confirm the work, and no failures are pending.",
+        false: "Work appears unfinished: the request was only partially addressed, recent tools show errors or unresolved failures, or the completion signal contradicts the evidence.",
+      },
+    },
+  });
+
+  if (!answers) return null;
+  const noulAnswer = answers.task_fully_complete as JevNoulAnswer | undefined;
+  return noulAnswer ? { isComplete: noulAnswer.noul } : null;
+}
+
+// ---------------------------------------------------------------------------
+// Wrap-up auto-continue (de-escalation)
+// Fires when the sentinel token is detected at session.idle. Hands the final
+// report generation (the 1-2 "wrap-up" reasoning cycles) to the cheap model,
+// which reads the full session history and writes the user-facing report.
+// ---------------------------------------------------------------------------
+
+async function triggerWrapUp(client: any, sessionID: string): Promise<void> {
+  const ctx = getContext(sessionID);
+
+  // Text generation role: the report model is the "good writer" among the
+  // cheap models (falls back to small_model, then to the session's model).
+  const config = readOpencodeConfig();
+  const models = readJevModels();
+  const parsedReport = models.reportModel ? parseModelString(models.reportModel) : null;
+
+  const reportUsable = !!(parsedReport && isProviderUsable(parsedReport.providerID, config));
+  const fallback = parseModelString(ctx.currentModelStr || "");
+
+  // Prefer the dedicated report model; fall back to the session's model so the
+  // report is still delivered even when it is not configured/authorized.
+  const modelToUse = reportUsable
+    ? parsedReport
+    : fallback && isProviderUsable(fallback.providerID, config)
+    ? fallback
+    : null;
+
+  if (!modelToUse) {
+    log("WRAP-UP aborted: no usable model found for the report cycle.");
+    return;
+  }
+
+  ctx.status = "WRAP_UP";
+  ctx.wrapUpActive = true;
+
+  log(
+    `WRAP-UP: auto-continue on session ${sessionID} → ` +
+    `${modelToUse.providerID}/${modelToUse.modelID} (${reportUsable ? "report_model" : "fallback core"})`
+  );
+
+  try {
+    fs.appendFileSync(
+      path.join(CONFIG_DIR, "jev_classifications.jsonl"),
+      JSON.stringify({
+        timestamp: getLocalTimestamp(),
+        type: "wrap_up",
+        sessionID,
+        request: `[WRAP-UP] report cycle → ${modelToUse.providerID}/${modelToUse.modelID}`,
+        domain: "WRAP_UP",
+        domainConf: 1,
+      }) + "\n"
+    );
+  } catch (_) {}
+
+  try {
+    await client.session.prompt({
+      path: { id: sessionID },
+      body: {
+        model: { providerID: modelToUse.providerID, modelID: modelToUse.modelID },
+        parts: [{ type: "text", text: WRAPUP_TRIGGER_TEXT }],
+      },
+    });
+    log("WRAP-UP: report cycle finished.");
+  } catch (err) {
+    log(`WRAP-UP prompt failed: ${(err as Error).message}`);
+    ctx.wrapUpActive = false;
+    ctx.status = "NORMAL";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Context Harvester — micro-worker
+// Large tool outputs are compressed by the small model inside an isolated
+// child session (JEV hooks never fire on it). The raw output is archived to
+// jev_harvests.jsonl and the compressed version replaces it inline, so the
+// core model never burns context on log noise.
+// ---------------------------------------------------------------------------
+
+interface HarvesterConfig {
+  enabled: boolean;
+  thresholdChars: number;   // only outputs >= this are harvested
+  maxInputChars: number;    // cap of raw text sent to the small model
+  timeoutMs: number;        // hard deadline; on timeout the raw output is kept
+}
+
+const HARVESTER_DEFAULTS: HarvesterConfig = {
+  enabled: true,
+  thresholdChars: 3000,
+  maxInputChars: 12000,
+  timeoutMs: 25000,
+};
+
+function getHarvesterConfig(jevState: { harvester?: Partial<HarvesterConfig> }): HarvesterConfig {
+  return { ...HARVESTER_DEFAULTS, ...(jevState.harvester ?? {}) };
+}
+
+// Sessions spawned by the harvester — our hooks must never fire on them.
+// IDs are kept forever (the server-side session is deleted after each run).
+const harvestSessionIds = new Set<string>();
+
+// Tools whose output is structured content (files, todos), not execution logs.
+const HARVEST_SKIP_TOOLS = new Set([
+  "read", "glob", "grep", "list", "todoread", "todowrite", "question", "edit", "write",
+]);
+
+const HARVEST_SYSTEM_PROMPT = [
+  "You are JEV-HARVESTER, a deterministic micro-worker that compresses raw tool output before it reaches the primary reasoning model.",
+  "Rules (strict):",
+  "- Preserve VERBATIM: error messages, stack traces, exit codes, file paths, env var names, command lines, identifiers.",
+  "- Drop noise: progress bars, spinner frames, repeated lines (emit \"[...N similar lines omitted]\"), banners, ANSI escape codes, raw HTML.",
+  "- Output format (plain text, no markdown fences):",
+  "  STATUS: success | failure | ambiguous",
+  "  ERRORS: <exact error lines, or \"none\">",
+  "  SUMMARY: <1-5 compact lines>",
+  "  KEY DATA: <essential values/paths/json projections>",
+  "- Hard cap ~40 lines. Never invent content. Never call tools. Reply with the compressed text only.",
+].join("\n");
+
+// Error/result text usually lives at the tail of logs; sample head+center/head-out.
+function sampleForHarvest(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = Math.min(2000, Math.floor(maxChars * 0.2));
+  const tail = maxChars - head;
+  return `${text.slice(0, head)}\n[...middle ${text.length - maxChars} chars sampled out...]\n${text.slice(-tail)}`;
+}
+
+async function harvestToolOutput(
+  client: any,
+  parentSessionID: string,
+  tool: string,
+  args: unknown,
+  rawOutput: string,
+  smallModel: string,
+  cfg: HarvesterConfig
+): Promise<string | null> {
+  if (!client?.session) { log("HARVEST skipped: no OpenCode client in plugin context."); return null; }
+  const parsedModel = parseModelString(smallModel);
+  if (!parsedModel) { log(`HARVEST skipped: invalid harvester_model "${smallModel}"`); return null; }
+
+  const payload = sampleForHarvest(rawOutput, cfg.maxInputChars);
+  const argsPreview = args ? JSON.stringify(args).substring(0, 500) : "";
+
+  let childID: string | null = null;
+  const startedAt = Date.now();
+
+  const work = async (): Promise<string | null> => {
+    const created = await client.session.create({
+      body: { parentID: parentSessionID, title: `jev-harvester:${tool}` },
+    });
+    childID = created?.data?.id ?? null;
+    if (!childID) return null;
+    harvestSessionIds.add(childID);
+
+    const resp = await client.session.prompt({
+      path: { id: childID },
+      body: {
+        model: { providerID: parsedModel.providerID, modelID: parsedModel.modelID },
+        system: HARVEST_SYSTEM_PROMPT,
+        parts: [{
+          type: "text",
+          text: `TOOL: ${tool}\nARGS: ${argsPreview}\n--- RAW OUTPUT (${rawOutput.length} chars) ---\n${payload}`,
+        }],
+      },
+    });
+    if (resp?.error) throw new Error(JSON.stringify(resp.error));
+
+    const parts = resp?.data?.parts ?? [];
+    return (
+      parts
+        .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+        .map((p: any) => p.text)
+        .join("\n")
+        .trim() || null
+    );
+  };
+
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`harvest timeout after ${cfg.timeoutMs}ms`)), cfg.timeoutMs)
+  );
+
+  try {
+    const summary = await Promise.race([work(), timeout]);
+    log(`HARVEST [${tool}] ${rawOutput.length} -> ${summary?.length ?? 0} chars in ${Date.now() - startedAt}ms`);
+    return summary;
+  } catch (err) {
+    log(`HARVEST [${tool}] failed: ${(err as Error).message}`);
+    return null;
+  } finally {
+    if (childID) {
+      try { await client.session.delete({ path: { id: childID } }); } catch (_) {}
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers — read jev_state.json (enabled flags etc.)
+// ---------------------------------------------------------------------------
+
+function readJevState(): Record<string, any> {
+  try {
+    const jevStatePath = path.join(CONFIG_DIR, "jev_state.json");
+    if (fs.existsSync(jevStatePath)) {
+      return JSON.parse(fs.readFileSync(jevStatePath, "utf8")) as Record<string, any>;
+    }
+  } catch (_) {}
+  return {};
+}
+
+// ---------------------------------------------------------------------------
+// Model role resolution (opencode.jsonc → "jev" object)
+// Small models are specialized: good collectors are not always good text
+// generators, so harvester and report roles have dedicated keys with the
+// generic small_model as fallback. The heavy model has two variants:
+// planner (thinking/architecture) and coding (fast execution).
+//
+//   jev.harvesterModel → Context Harvester (coletor de traces/logs)
+//   jev.reportModel    → wrap-up report generator (gerador de rich text)
+//   jev.plannerModel   → heavy variant — planning/escalation
+//   jev.codingModel    → heavy variant — core coding executor
+// ---------------------------------------------------------------------------
+
+interface JevModelConfig {
+  smallModel: string;      // generic small fallback (small_model)
+  harvesterModel: string;  // coletor
+  reportModel: string;     // gerador de texto (wrap-up)
+  plannerModel: string;    // heavy: planning variant
+  codingModel: string;     // heavy: coding variant
+}
+
+function readJevModels(): JevModelConfig {
+  const config = readOpencodeConfig();
+  const jev = (config?.jev as Record<string, unknown> | undefined) ?? {};
+  const smallModel = (config?.small_model as string) || "";
+  return {
+    smallModel,
+    harvesterModel: (jev.harvesterModel as string) || smallModel,
+    reportModel: (jev.reportModel as string) || smallModel,
+    plannerModel:
+      (jev.plannerModel as string) ||
+      ((config?.agent as any)?.plan?.model as string) ||
+      "",
+    codingModel: (jev.codingModel as string) || "",
+  };
+}
+
+// Defensive extraction of a message object from an event payload.
+// Payload shapes vary between opencode versions ({ info }, { message }, or
+// the message itself) — try all known paths.
+function extractMessageFromEvent(properties: any): any | null {
+  if (!properties) return null;
+  if (properties.message) return properties.message;
+  if (properties.info) return properties.info;
+  if ((properties.id || properties.messageID) && (properties.parts || properties.role)) return properties;
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin export
 // ---------------------------------------------------------------------------
 
-export default (async (_ctx: unknown) => {
+export default (async (ctx: unknown) => {
+  const client = (ctx as any)?.client;
+
   // Autostart web dashboard silently
   try {
     const dashboardPath = path.join(moduleDir, "dashboard.js");
@@ -452,10 +832,102 @@ export default (async (_ctx: unknown) => {
 
   return {
     // -------------------------------------------------------------------------
+    // Hook 0: event — SENTINEL DETECTION + WRAP-UP TRIGGER
+    // Tracks the last assistant message per session (redundantly with
+    // chat.message's role=assistant branch) and, on session.idle, checks for
+    // the completion token. Token + Noul audit → de-escalation (wrap-up).
+    // -------------------------------------------------------------------------
+    "event": async ({ event }: { event: { type: string; properties?: any } }) => {
+      try {
+        if (event.type === "message.updated" || event.type === "message.part.updated") {
+          const msg = extractMessageFromEvent(event.properties);
+          if (!msg) return;
+          if (msg.role !== "assistant") return;
+          const sessionID = msg.sessionID ?? event.properties?.sessionID;
+          if (!sessionID || harvestSessionIds.has(sessionID)) return;
+
+          const text = (msg.parts ?? [])
+            .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+            .map((p: any) => p.text)
+            .join("")
+            .trim();
+
+          lastAssistantBySession.set(sessionID, {
+            id: msg.id ?? "",
+            text,
+            time: Date.now(),
+          });
+          return;
+        }
+
+        if (event.type === "session.idle") {
+          const sessionID =
+            event.properties?.sessionID ?? event.properties?.id ?? event.properties?.session?.id;
+          if (!sessionID || harvestSessionIds.has(sessionID)) return;
+
+          const jevState = readJevState();
+          if (jevState.enabled !== true) return;
+
+          const ctxS = getContext(sessionID);
+
+          // A wrap-up report cycle just finished (or another turn ended while
+          // wrap-up was in flight): restore NORMAL so the next real user
+          // message gets fresh classification.
+          if (ctxS.wrapUpActive) {
+            log("WRAP-UP report cycle complete. Restoring NORMAL status.");
+            ctxS.wrapUpActive = false;
+            ctxS.status = "NORMAL";
+            return;
+          }
+
+          const last = lastAssistantBySession.get(sessionID);
+          const lastText = (last?.text ?? "").trim();
+          if (lastText !== TASK_COMPLETE_TOKEN) return;
+
+          log(`SENTINEL detected: assistant signaled task completion on session ${sessionID}.`);
+
+          // Auditor layer: one cheap noul double-check against premature
+          // completion. If the JEV API is unavailable, trust the token.
+          const apiKey = resolveApiKey();
+          if (apiKey) {
+            const audit = await queryJevWrapUpAudit(apiKey, ctxS);
+            if (audit) {
+              log(`WRAP-UP AUDIT: complete_probability=${audit.isComplete.toFixed(2)}`);
+              try {
+                fs.appendFileSync(
+                  path.join(CONFIG_DIR, "jev_classifications.jsonl"),
+                  JSON.stringify({
+                    timestamp: getLocalTimestamp(),
+                    type: "wrap_up_audit",
+                    sessionID,
+                    isComplete: audit.isComplete,
+                    accepted: audit.isComplete >= 0.5,
+                  }) + "\n"
+                );
+              } catch (_) {}
+
+              if (audit.isComplete < 0.5) {
+                log("WRAP-UP AUDIT rejected the completion signal. Keeping the current model.");
+                return;
+              }
+            }
+          }
+
+          await triggerWrapUp(client, sessionID);
+        }
+      } catch (err) {
+        log(`event error: ${(err as Error).message}`);
+      }
+    },
+
+    // -------------------------------------------------------------------------
     // Hook 1: chat.message
-    // Fires when the user message arrives, BEFORE the LLM processes it.
-    // Primary model swap vector: override output.message.model.
-    // Also checks if reactive escalation is active (from prior tool failures).
+    // Fires when a message arrives. For user messages: runs the routing +
+    // complexity classification and seeds the unified JevSessionContext with
+    // the ORIGINAL intent (so it survives the whole intra-loop). For
+    // assistant messages: feeds the sentinel tracker. For the injected
+    // wrap-up message: bypasses classification entirely.
+    // Redundant model override (primary vector); system.transform re-applies.
     // -------------------------------------------------------------------------
     "chat.message": async (
       input: {
@@ -480,25 +952,26 @@ export default (async (_ctx: unknown) => {
     ) => {
       try {
         pruneCache();
+        if (harvestSessionIds.has(input.sessionID)) return;
         log(`--- chat.message | session: ${input.sessionID} ---`);
 
-        const jevStatePath = path.join(CONFIG_DIR, "jev_state.json");
-        let jevState = {
-          enabled: false,
-          confidenceThreshold: 0.6,
-          blockDangerous: false,   // opt-in: block dangerous tool calls
-          stats: { totalCalls: 0, models: {} as Record<string, number> },
-        };
-        try {
-          if (fs.existsSync(jevStatePath)) {
-            jevState = { ...jevState, ...JSON.parse(fs.readFileSync(jevStatePath, "utf8")) };
-          }
-        } catch (_) {}
+        const jevState = readJevState();
+        if (jevState.enabled !== true) { log("Bypass: JEV disabled."); return; }
 
-        if (!jevState.enabled) { log("Bypass: JEV disabled."); return; }
-
-        const apiKey = resolveApiKey();
-        if (!apiKey) { log("Bypass: no API key."); return; }
+        // --- Sentinel tracker: assistant messages are captured, not classified.
+        if (output.message?.role === "assistant") {
+          const text = output.parts
+            .filter((p) => p.type === "text" && typeof p.text === "string")
+            .map((p) => p.text as string)
+            .join("")
+            .trim();
+          lastAssistantBySession.set(input.sessionID, {
+            id: output.message.id ?? "",
+            text,
+            time: Date.now(),
+          });
+          return;
+        }
 
         // Extract user message text from output.parts
         const textParts = output.parts
@@ -508,15 +981,36 @@ export default (async (_ctx: unknown) => {
         if (!textParts.length) { log("Bypass: no text parts."); return; }
         const messageText = textParts.join("\n").trim();
         if (!messageText) { log("Bypass: empty message."); return; }
+
+        // --- Wrap-up injected message: keep WRAP_UP status, bypass classification.
+        if (messageText.startsWith(WRAPUP_MARKER)) {
+          log("WRAP-UP cycle message detected — bypassing classification.");
+          return;
+        }
+
+        const ctxS = getContext(input.sessionID);
+
+        // A new REAL user message starts a fresh task cycle: clear lifecycle
+        // flags so stale escalation/wrap-up state never leaks into new intents.
+        ctxS.status = "NORMAL";
+        ctxS.wrapUpActive = false;
+        ctxS.forceEscalate = false;
+        ctxS.failureCount = 0;
+
+        const apiKey = resolveApiKey();
+        if (!apiKey) { log("Bypass: no API key."); return; }
+
         log(`Message (preview): ${messageText.substring(0, 100)}`);
 
         const config = readOpencodeConfig();
         const currentModelObj = input.model ?? output.message.model ?? { providerID: "unknown", modelID: "unknown" };
         const currentModelStr = `${currentModelObj.providerID}/${currentModelObj.modelID}`;
-        const smallModel = (config?.small_model as string) || "";
-        const plannerModel = (config?.agent as any)?.plan?.model || "";
-        const mcpConfig = config?.mcp as Record<string, unknown> | undefined;
-        const availableTools = Object.keys(buildDynamicCriteria(mcpConfig));
+        const models = readJevModels();
+        const availableTools = Object.keys(buildDynamicCriteria(config?.mcp as Record<string, unknown> | undefined));
+
+        // --- Capture the original intent BEFORE anything else can fail ---
+        ctxS.originalRequest = messageText.substring(0, 2000);
+        ctxS.currentModelStr = currentModelStr;
 
         // Call JEV for routing + complexity
         const answers = await queryJevRouting(
@@ -529,55 +1023,48 @@ export default (async (_ctx: unknown) => {
         const compAns = answers.task_complexity as JevScoreAnswer | undefined;
 
         const threshold = jevState.confidenceThreshold ?? 0.6;
-        let complexityScore = compAns?.score ?? 1.0;
+        const complexityScore = compAns?.score ?? 1.0;
         const complexityConf = compAns?.confidence ?? 0;
-
-        // --- Reactive escalation override ---
-        // If prior tool failures reached threshold, force COMPLEX regardless of JEV score.
-        // This is the canonical mid-loop escalation pattern from TypeSafe docs.
-        const guardrail = getGuardrailState(input.sessionID);
-        if (guardrail.forceEscalate) {
-          complexityScore = 2.0;
-          guardrail.forceEscalate = false; // consume the escalation flag
-          log(`REACTIVE ESCALATION: Forcing complexity=2.0 (planner) after ${guardrail.failureCount} failures.`);
-          guardrail.failureCount = 0;
-        }
 
         log(`Domain: ${domainAns.choice} (conf: ${domainAns.confidence.toFixed(2)})`);
         log(`Complexity: score=${complexityScore.toFixed(2)} conf=${complexityConf.toFixed(2)}`);
 
         const routing = resolveTargetModel(
-          complexityScore, complexityConf, smallModel, plannerModel, currentModelStr
+          complexityScore, complexityConf,
+          models.smallModel, models.plannerModel, models.codingModel, currentModelStr
         );
 
         // Guard: never override to a provider OpenCode cannot serve, otherwise
         // the LLM call hangs waiting for a non-existent provider/model.
-        if (routing.target !== "core") {
+        // Applies to small/planner targets AND to the coding-variant override
+        // of the core target.
+        if (routing.target !== "core" || routing.modelStr !== currentModelStr) {
           const parsedTarget = parseModelString(routing.modelStr);
           if (!parsedTarget || !isProviderUsable(parsedTarget.providerID, config)) {
-            log(`Override skipped: provider "${parsedTarget?.providerID ?? routing.modelStr}" not configured/authorized. Keeping core model.`);
+            log(`Override skipped: provider "${parsedTarget?.providerID ?? routing.modelStr}" not configured/authorized. Keeping session model.`);
             routing.target = "core";
             routing.modelStr = currentModelStr;
           }
         }
         log(`Routing → ${routing.target.toUpperCase()} (${routing.modelStr})`);
 
-        // Cache decision for system.transform
-        sessionDecisionCache.set(input.sessionID, {
-          domain: domainAns.choice,
-          domainConfidence: domainAns.confidence,
-          complexityScore,
-          complexityConfidence: complexityConf,
-          targetModel: routing.target,
-          targetModelStr: routing.modelStr,
-          timestamp: Date.now(),
-        });
+        // Cache the full decision for system.transform (consumed on every
+        // subsequent intra-loop LLM call).
+        ctxS.domain = domainAns.choice;
+        ctxS.domainConfidence = domainAns.confidence;
+        ctxS.complexityScore = complexityScore;
+        ctxS.complexityConfidence = complexityConf;
+        ctxS.targetModel = routing.target;
+        ctxS.targetModelStr = routing.modelStr;
+        ctxS.hasRouting = true;
 
         // Update stats
         try {
+          jevState.stats = jevState.stats ?? { totalCalls: 0, models: {} };
           jevState.stats.totalCalls = (jevState.stats.totalCalls || 0) + 1;
+          jevState.stats.models = jevState.stats.models ?? {};
           jevState.stats.models[routing.target] = (jevState.stats.models[routing.target] || 0) + 1;
-          fs.writeFileSync(jevStatePath, JSON.stringify(jevState, null, 2));
+          fs.writeFileSync(path.join(CONFIG_DIR, "jev_state.json"), JSON.stringify(jevState, null, 2));
         } catch (_) {}
 
         // Model swap: override output.message.model (primary mechanism)
@@ -608,15 +1095,10 @@ export default (async (_ctx: unknown) => {
       output: { args: Record<string, unknown> }
     ) => {
       try {
-        const jevStatePath = path.join(CONFIG_DIR, "jev_state.json");
-        let jevState = { enabled: false, blockDangerous: false };
-        try {
-          if (fs.existsSync(jevStatePath)) {
-            jevState = { ...jevState, ...JSON.parse(fs.readFileSync(jevStatePath, "utf8")) };
-          }
-        } catch (_) {}
+        if (harvestSessionIds.has(input.sessionID)) return;
 
-        if (!jevState.enabled) return;
+        const jevState = readJevState();
+        if (jevState.enabled !== true) return;
 
         // Polyvalent skip: only bypass tools that are provably read-only.
         // Everything else — bash, write, edit, MCP mutations, custom tools —
@@ -652,8 +1134,8 @@ export default (async (_ctx: unknown) => {
           } catch (_) {}
 
           // Update guardrail stats
-          const guardrail = getGuardrailState(input.sessionID);
-          guardrail.blockedToolCalls++;
+          const ctxS = getContext(input.sessionID);
+          ctxS.blockedToolCalls++;
 
           if (jevState.blockDangerous) {
             // Hard block: throw prevents the tool from running
@@ -678,91 +1160,164 @@ export default (async (_ctx: unknown) => {
     // "Classify agent traces, detect errors in real time."
     //
     // Monitors the output of ANY tool — bash, MCP calls, custom tools.
-    // An MCP tool returning an API error, a failed VPS operation, or a
-    // rejected DNS change all count as failures and feed the escalation loop.
-    // Consecutive failures → forceEscalate flag → next turn routes to Planner.
-    //
-    // Exception: local content tools (read/glob/grep/list) return file content,
-    // not execution results — "output" may contain the word "error" as data.
-    // Their actual failures are thrown by the tool itself, so we skip them.
+    // Consecutive failures → forceEscalate flag → system.transform escalates
+    // the NEXT LLM call (even mid-loop) to the Planner model.
+    // Consecutive successes after a rescue → de-escalate back to NORMAL.
     // -------------------------------------------------------------------------
     "tool.execute.after": async (
       input: { tool: string; sessionID: string; callID: string; args: unknown },
       output: { title: string; output: string; metadata: unknown }
     ) => {
       try {
+        if (harvestSessionIds.has(input.sessionID)) return;
+
         // Local content tools: output is data, not an execution result.
         // (MCP read tools are NOT skipped — their API errors matter.)
         const LOCAL_CONTENT_TOOLS = new Set(["read", "glob", "grep", "list", "todoread"]);
-        if (LOCAL_CONTENT_TOOLS.has(input.tool)) return;
 
         const jevStatePath = path.join(CONFIG_DIR, "jev_state.json");
-        let jevEnabled = false;
+        let jevState: any = { enabled: false, stats: { totalCalls: 0, models: {} } };
         try {
           if (fs.existsSync(jevStatePath)) {
-            jevEnabled = JSON.parse(fs.readFileSync(jevStatePath, "utf8")).enabled === true;
+            jevState = { ...jevState, ...JSON.parse(fs.readFileSync(jevStatePath, "utf8")) };
           }
         } catch (_) {}
 
-        if (!jevEnabled) return;
-
-        const apiKey = resolveApiKey();
-        if (!apiKey) return;
+        if (!jevState.enabled) return;
 
         // Skip very short outputs (usually successful with no output)
         const toolOutput = (output.output ?? "").trim();
         if (toolOutput.length < 10) return;
 
-        // Polyvalent: monitor every tool's output, regardless of origin.
-        const result = await queryJevFailureDetect(
-          apiKey,
-          input.tool,
-          output.title,
-          input.args,
-          toolOutput
-        );
-        if (!result) return;
+        const apiKey = resolveApiKey();
 
-        const { isFailure } = result;
-        log(`FAILURE DETECT [${input.tool}] failure_probability=${isFailure.toFixed(2)}`);
+        // Worker 1: failure detection → reactive escalation (needs OpenRouter key)
+        const failurePromise = (async () => {
+          if (!apiKey || LOCAL_CONTENT_TOOLS.has(input.tool)) return;
 
-        if (isFailure > 0.78) {
-          const guardrail = getGuardrailState(input.sessionID);
-          guardrail.failureCount++;
-          guardrail.lastFailureTimestamp = Date.now();
+          const result = await queryJevFailureDetect(
+            apiKey,
+            input.tool,
+            output.title,
+            input.args,
+            toolOutput
+          );
+          if (!result) return;
 
-          log(`Session ${input.sessionID} failure count: ${guardrail.failureCount}/${ESCALATION_FAILURE_THRESHOLD}`);
+          const { isFailure } = result;
+          log(`FAILURE DETECT [${input.tool}] failure_probability=${isFailure.toFixed(2)}`);
+
+          const ctxS = getContext(input.sessionID);
+          recordToolTrace(input.sessionID, input.tool, isFailure > 0.5);
+
+          if (isFailure > 0.78) {
+            ctxS.failureCount++;
+            ctxS.lastFailureTimestamp = Date.now();
+
+            log(`Session ${input.sessionID} failure count: ${ctxS.failureCount}/${ESCALATION_FAILURE_THRESHOLD}`);
+
+            try {
+              fs.appendFileSync(
+                path.join(CONFIG_DIR, "jev_classifications.jsonl"),
+                JSON.stringify({
+                  timestamp: getLocalTimestamp(),
+                  type: "failure_detect",
+                  sessionID: input.sessionID,
+                  tool: input.tool,
+                  isFailure,
+                  failureCount: ctxS.failureCount,
+                }) + "\n"
+              );
+            } catch (_) {}
+
+            if (ctxS.failureCount >= ESCALATION_FAILURE_THRESHOLD) {
+              // Set the reactive escalation flag. system.transform consumes it
+              // on the next LLM call — INCLUDING intra-loop calls — forcing the
+              // Planner model without waiting for a new user message.
+              ctxS.forceEscalate = true;
+              ctxS.status = "ESCALATED";
+              log(
+                `REACTIVE ESCALATION TRIGGERED: ${ctxS.failureCount} consecutive failures → ` +
+                `next LLM call will force the Planner model.`
+              );
+            }
+          } else if (isFailure < 0.30) {
+            // Successful tool call — gradually reset failure counter
+            if (ctxS.failureCount > 0) {
+              ctxS.failureCount = Math.max(0, ctxS.failureCount - 1);
+              log(`Failure counter decremented → ${ctxS.failureCount} (successful tool call)`);
+            }
+            // De-escalation: the rescue model fixed the problem (successes
+            // resumed) — stop burning the expensive planner on every cycle.
+            if (ctxS.status === "ESCALATED" && ctxS.failureCount === 0 && !ctxS.forceEscalate) {
+              ctxS.status = "NORMAL";
+              log("DE-ESCALATION: consecutive successes after rescue — restoring NORMAL routing.");
+            }
+          }
+        })();
+
+        // Worker 2: context harvester — the COLLECTOR small model compresses
+        // large outputs (specialized role: fast extraction, verbatim fidelity)
+        const cfg = getHarvesterConfig(jevState);
+        const harvestPromise = (async (): Promise<string | null> => {
+          if (!cfg.enabled) return null;
+          if (HARVEST_SKIP_TOOLS.has(input.tool)) return null;
+          if (toolOutput.length < cfg.thresholdChars) return null;
+
+          const models = readJevModels();
+          const harvesterModelStr = models.harvesterModel;
+          const parsedModel = harvesterModelStr ? parseModelString(harvesterModelStr) : null;
+          if (!parsedModel || !isProviderUsable(parsedModel.providerID, readOpencodeConfig())) {
+            log(`HARVEST skipped: harvester_model "${harvesterModelStr}" not configured/authorized.`);
+            return null;
+          }
+
+          return harvestToolOutput(client, input.sessionID, input.tool, input.args, toolOutput, harvesterModelStr, cfg);
+        })();
+
+        const [, summary] = await Promise.all([failurePromise, harvestPromise]);
+
+        if (summary) {
+          // Archive the raw output, then replace it inline with the compressed version.
+          try {
+            fs.appendFileSync(
+              path.join(CONFIG_DIR, "jev_harvests.jsonl"),
+              JSON.stringify({
+                timestamp: getLocalTimestamp(),
+                sessionID: input.sessionID,
+                tool: input.tool,
+                chars: toolOutput.length,
+                args: input.args ? JSON.stringify(input.args).substring(0, 400) : undefined,
+                raw: toolOutput,
+              }) + "\n"
+            );
+          } catch (_) {}
+
+          output.output =
+            `[JEV CONTEXT HARVESTER — ${toolOutput.length} → ${summary.length} chars | raw archived in jev_harvests.jsonl]\n\n` +
+            summary;
+
+          try {
+            jevState.stats = jevState.stats ?? {};
+            jevState.stats.harvests = (jevState.stats.harvests ?? 0) + 1;
+            jevState.stats.charsSaved = (jevState.stats.charsSaved ?? 0) + Math.max(0, toolOutput.length - summary.length);
+            fs.writeFileSync(jevStatePath, JSON.stringify(jevState, null, 2));
+          } catch (_) {}
 
           try {
             fs.appendFileSync(
               path.join(CONFIG_DIR, "jev_classifications.jsonl"),
               JSON.stringify({
                 timestamp: getLocalTimestamp(),
-                type: "failure_detect",
+                type: "harvest",
                 sessionID: input.sessionID,
                 tool: input.tool,
-                isFailure,
-                failureCount: guardrail.failureCount,
+                request: `[HARVEST] ${input.tool}: ${toolOutput.length} → ${summary.length} chars`,
+                domain: "HARVEST",
+                domainConf: 1,
               }) + "\n"
             );
           } catch (_) {}
-
-          if (guardrail.failureCount >= ESCALATION_FAILURE_THRESHOLD) {
-            // Set the reactive escalation flag.
-            // On the next chat.message hook, this forces complexityScore=2.0 → Planner model.
-            guardrail.forceEscalate = true;
-            log(
-              `REACTIVE ESCALATION TRIGGERED: ${guardrail.failureCount} consecutive failures → ` +
-              `next turn will force Planner model.`
-            );
-          }
-        } else if (isFailure < 0.30) {
-          // Successful tool call — gradually reset failure counter
-          const guardrail = getGuardrailState(input.sessionID);
-          if (guardrail.failureCount > 0) {
-            guardrail.failureCount = Math.max(0, guardrail.failureCount - 1);
-            log(`Failure counter decremented → ${guardrail.failureCount} (successful tool call)`);
-          }
         }
       } catch (err) {
         log(`tool.execute.after error: ${(err as Error).message}`);
@@ -771,79 +1326,135 @@ export default (async (_ctx: unknown) => {
 
     // -------------------------------------------------------------------------
     // Hook 4: experimental.chat.system.transform
-    // Fires just before the LLM call.
-    // CORRECT output format: { system: string[] } — push segments, never replace.
-    // Reads cached JEV decision from chat.message.
+    // Fires just before EVERY LLM call — first call AND every intra-loop
+    // reasoning cycle. This is the authoritative, always-on router:
+    //
+    //   status WRAP_UP   → keep the cheap model, inject the report directive
+    //   forceEscalate    → mutate to the Planner + inject the rescue directive
+    //   cached routing   → re-apply model + inject routing directive (redundant
+    //                      with chat.message's override, covering intra-loop)
+    //   every non-wrap-up cycle → inject the sentinel completion protocol
     // -------------------------------------------------------------------------
     "experimental.chat.system.transform": async (
       input: { sessionID?: string; model: unknown },
       output: { system: string[] }
     ) => {
       try {
+        if (!input.sessionID) return;
+        if (harvestSessionIds.has(input.sessionID)) return;
         log(`--- system.transform | session: ${input.sessionID} ---`);
 
-        if (!input.sessionID) return;
+        const jevState = readJevState();
+        if (jevState.enabled !== true) return;
 
-        let jevEnabled = false;
-        try {
-          const jevStatePath = path.join(CONFIG_DIR, "jev_state.json");
-          if (fs.existsSync(jevStatePath)) {
-            jevEnabled = JSON.parse(fs.readFileSync(jevStatePath, "utf8")).enabled === true;
-          }
-        } catch (_) {}
-
-        if (!jevEnabled) return;
+        const ctxS = getContext(input.sessionID);
 
         // Inject persistent context basket (anti-amnesia memory)
         try {
           const contextPath = path.join(process.cwd(), ".opencode", "jev_context.md");
           if (fs.existsSync(contextPath)) {
-            const ctx = fs.readFileSync(contextPath, "utf8").trim();
-            if (ctx) {
+            const ctxBasket = fs.readFileSync(contextPath, "utf8").trim();
+            if (ctxBasket) {
               output.system.push(
-                `[JEV CONTEXT BASKET / MEMORY]\n${ctx}\n(Update: \`opencode-jev context "text"\`)`
+                `[JEV CONTEXT BASKET / MEMORY]\n${ctxBasket}\n(Update: \`opencode-jev context "text"\`)`
               );
               log("Context basket injected.");
             }
           }
         } catch (_) {}
 
-        // Read cached routing decision from chat.message hook
-        const decision = sessionDecisionCache.get(input.sessionID);
-        if (!decision) {
-          log("No cached decision — chat.message may have bypassed.");
+        // ---------------------------------------------------------------------
+        // WRAP_UP: the cheap report cycle. No routing directive, no sentinel
+        // directive (anti-loop), no model mutation — the wrap-up prompt body
+        // already pinned the small model.
+        // ---------------------------------------------------------------------
+        if (ctxS.status === "WRAP_UP") {
+          output.system.push(WRAPUP_DIRECTIVE);
+          log("Directive pushed. WRAP_UP (report cycle).");
           return;
         }
 
-        const { domain, domainConfidence, complexityScore, targetModel, targetModelStr } = decision;
+        // ---------------------------------------------------------------------
+        // REACTIVE ESCALATION (mid-loop): consume the forceEscalate flag and
+        // mutate THIS LLM call to the Planner model, with a rescue directive
+        // carrying the original intent — no new user message required.
+        // ---------------------------------------------------------------------
+        if (ctxS.forceEscalate) {
+          ctxS.forceEscalate = false; // consume the escalation flag
+          ctxS.status = "ESCALATED";
+          log(
+            `REACTIVE ESCALATION: forcing Planner model mid-loop ` +
+            `(after ${ctxS.failureCount} consecutive tool failures).`
+          );
 
-        const complexityLabel =
-          complexityScore < TRIVIAL_THRESHOLD
-            ? "TRIVIAL — prefer fast, direct actions; avoid over-engineering"
-            : complexityScore > COMPLEX_THRESHOLD
-            ? "COMPLEX — reason carefully step-by-step before acting"
-            : "STANDARD — focused, efficient solution";
+          // Heavy model — planning variant (deep reasoning/architecture).
+          const models = readJevModels();
+          const parsedPlanner = models.plannerModel ? parseModelString(models.plannerModel) : null;
 
-        // Push routing directive to system array (correct API: push, never replace)
-        output.system.push(
-          `[JEV ROUTING DIRECTIVE]\n` +
-          `Tool Domain : ${domain} (confidence: ${(domainConfidence * 100).toFixed(0)}%)\n` +
-          `Complexity  : ${complexityLabel} (score: ${complexityScore.toFixed(2)})\n` +
-          `Model Target: ${targetModel.toUpperCase()} (${targetModelStr})\n` +
-          `Instruction : Prioritize the "${domain}" category for your next action. ` +
-          `Adjust reasoning depth to match the complexity level above.`
-        );
-
-        log(`Directive pushed. Domain: ${domain}, Score: ${complexityScore.toFixed(2)}, Model: ${targetModel}`);
-
-        // Belt-and-suspenders backup model mutation
-        if (targetModel !== "core") {
-          const parsed = parseModelString(targetModelStr);
-          if (parsed) {
-            (output as any).model = { providerID: parsed.providerID, modelID: parsed.modelID };
-            log(`Backup model mutation: ${parsed.providerID}/${parsed.modelID}`);
+          if (parsedPlanner && isProviderUsable(parsedPlanner.providerID, readOpencodeConfig())) {
+            (output as any).model = { providerID: parsedPlanner.providerID, modelID: parsedPlanner.modelID };
+            log(`Escalation model mutation (planning variant): ${parsedPlanner.providerID}/${parsedPlanner.modelID}`);
+          } else {
+            log(`Escalation fallback: planner model not usable, keeping current model.`);
           }
+
+          output.system.push(
+            `[JEV ESCALATION DIRECTIVE]\n` +
+            `The previous executor model failed repeatedly inside this loop. You are the ESCALATED PLANNER model.\n` +
+            `Original task: ${ctxS.originalRequest || "(unknown — recover from context)"}\n` +
+            `Failures detected: ${ctxS.failureCount} consecutive tool failures.\n` +
+            `Instruction: Reason step-by-step about the root cause, design the architectural solution, ` +
+            `then execute it with minimal, surgical changes. Resolve the blocker and finish the task.`
+          );
+          log("Directive pushed. ESCALATED (rescue cycle).");
+
+          // The sentinel protocol applies during the rescue as well, so the
+          // planner hands the report back to the cheap model when done.
+          output.system.push(SENTINEL_DIRECTIVE);
+          return;
         }
+
+        // ---------------------------------------------------------------------
+        // NORMAL: re-apply the cached routing decision (covers every intra-loop
+        // cycle — the redundancy requested for chat.message + transform) and
+        // inject routing + sentinel directives.
+        // ---------------------------------------------------------------------
+        if (ctxS.hasRouting) {
+          const { domain, domainConfidence, complexityScore, targetModel, targetModelStr } = ctxS;
+
+          const complexityLabel =
+            complexityScore < TRIVIAL_THRESHOLD
+              ? "TRIVIAL — prefer fast, direct actions; avoid over-engineering"
+              : complexityScore > COMPLEX_THRESHOLD
+              ? "COMPLEX — reason carefully step-by-step before acting"
+              : "STANDARD — focused, efficient solution";
+
+          output.system.push(
+            `[JEV ROUTING DIRECTIVE]\n` +
+            `Tool Domain : ${domain} (confidence: ${(domainConfidence * 100).toFixed(0)}%)\n` +
+            `Complexity  : ${complexityLabel} (score: ${complexityScore.toFixed(2)})\n` +
+            `Model Target: ${targetModel.toUpperCase()} (${targetModelStr})\n` +
+            `Instruction : Prioritize the "${domain}" category for your next action. ` +
+            `Adjust reasoning depth to match the complexity level above.`
+          );
+
+          // Belt-and-suspenders model mutation (chat.message is the primary
+          // vector; this re-application covers intra-loop LLM calls).
+          if (targetModel !== "core") {
+            const parsed = parseModelString(targetModelStr);
+            if (parsed && isProviderUsable(parsed.providerID, readOpencodeConfig())) {
+              (output as any).model = { providerID: parsed.providerID, modelID: parsed.modelID };
+            }
+          }
+
+          log(`Directive pushed. Domain: ${domain}, Score: ${complexityScore.toFixed(2)}, Model: ${targetModel}`);
+        } else {
+          log("No cached routing decision — chat.message may have bypassed.");
+        }
+
+        // Sentinel completion protocol — injected on every non-wrap-up cycle
+        // so it survives context drift and mid-session compaction.
+        output.system.push(SENTINEL_DIRECTIVE);
       } catch (err) {
         log(`system.transform error: ${(err as Error).message}`);
       }

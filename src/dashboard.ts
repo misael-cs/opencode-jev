@@ -52,7 +52,7 @@ function getJevState() {
     try {
         if (fs.existsSync(stateFile)) return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     } catch(e) {}
-    return { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, stats: { totalCalls: 0, models: {} } };
+    return { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, harvester: { enabled: true, thresholdChars: 3000, timeoutMs: 25000 }, stats: { totalCalls: 0, models: {}, harvests: 0, charsSaved: 0 } };
 }
 
 function saveJevState(state: any) {
@@ -140,7 +140,13 @@ function getAvailableModels(config: any): ModelEntry[] {
     if (!all.find((x) => x.id === m.id)) all.push(m);
   }
 
-  const currentModels = [config.small_model, config.agent?.plan?.model];
+  const currentModels = [
+    config.small_model,
+    config.jev?.harvesterModel,
+    config.jev?.reportModel,
+    config.jev?.plannerModel ?? config.agent?.plan?.model,
+    config.jev?.codingModel,
+  ];
   for (const m of currentModels) {
     if (m && !all.find((x) => x.id === m || `${x.id}-Free` === m)) {
       all.push({ id: m, name: `${m} (implícito/externo)`, provider: "Outros" });
@@ -186,8 +192,17 @@ async function saveOpencodeConfig(updates: any): Promise<void> {
   if (updates.small_model !== undefined) {
     currentText = applyEdits(currentText, modify(currentText, ["small_model"], updates.small_model, options));
   }
+  if (updates.harvester_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "harvesterModel"], updates.harvester_model, options));
+  }
+  if (updates.report_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "reportModel"], updates.report_model, options));
+  }
   if (updates.planner_model !== undefined) {
-    currentText = applyEdits(currentText, modify(currentText, ["agent", "plan", "model"], updates.planner_model, options));
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "plannerModel"], updates.planner_model, options));
+  }
+  if (updates.coding_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "codingModel"], updates.coding_model, options));
   }
   if (updates.jev_model !== undefined) {
     currentText = applyEdits(currentText, modify(currentText, ["decisionModel"], updates.jev_model, options));
@@ -272,6 +287,14 @@ const html = `<!DOCTYPE html>
                 <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
                     <h3 class="text-sm font-medium text-gray-400 mb-1">Total de Chamadas JEV</h3>
                     <p class="text-4xl font-black text-white" x-text="state.stats?.totalCalls || 0"></p>
+                </div>
+                <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
+                    <h3 class="text-sm font-medium text-gray-400 mb-1">Harvests (Context Harvester)</h3>
+                    <p class="text-4xl font-black text-white" x-text="state.stats?.harvests || 0"></p>
+                </div>
+                <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
+                    <h3 class="text-sm font-medium text-gray-400 mb-1">Chars economizados</h3>
+                    <p class="text-4xl font-black text-emerald-400" x-text="state.stats?.charsSaved || 0"></p>
                 </div>
             </div>
             
@@ -414,8 +437,40 @@ const html = `<!DOCTYPE html>
                         </div>
 
                         <div>
-                            <label class="block text-sm font-bold text-gray-300 mb-1">Context Harvester (Small Model)</label>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Modelo Harvester (Coletor)</label>
+                            <p class="text-xs text-gray-500 mb-2">Comprime outputs gigantes de tools (logs, scans). Otimizado para extração verbatim em alta velocidade — nem todo modelo barato escreve bem, mas bons coletores capturam tudo.</p>
+                            <select x-model="config.harvester_model" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                                <option value="">— Herdar do Small Model (fallback) —</option>
+                                <template x-for="provider in Object.keys(groupedModels)" :key="provider">
+                                    <optgroup :label="provider">
+                                        <template x-for="m in groupedModels[provider]" :key="m.id">
+                                            <option :value="m.id" x-text="m.name" :selected="config.harvester_model === m.id"></option>
+                                        </template>
+                                    </optgroup>
+                                </template>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Modelo Gerador de Texto (Wrap-up)</label>
+                            <p class="text-xs text-gray-500 mb-2">Escreve o relatório final rich text após a conclusão da tarefa (desescalada via sentinela [TAREFA_FINALIZADA]). Otimizado para prosa, Markdown e HTML — não para raciocínio.</p>
+                            <select x-model="config.report_model" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                                <option value="">— Herdar do Small Model (fallback) —</option>
+                                <template x-for="provider in Object.keys(groupedModels)" :key="provider">
+                                    <optgroup :label="provider">
+                                        <template x-for="m in groupedModels[provider]" :key="m.id">
+                                            <option :value="m.id" x-text="m.name" :selected="config.report_model === m.id"></option>
+                                        </template>
+                                    </optgroup>
+                                </template>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Small Model Genérico (Fallback)</label>
+                            <p class="text-xs text-gray-500 mb-2">Fallback dos dois papéis acima e executor de tarefas TRIVIAIS (formatação, perguntas simples). Deixar os papéis específicos vazios faz todos herdarem daqui.</p>
                             <select x-model="config.small_model" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                                <option value="">— Nenhum (desativado) —</option>
                                 <template x-for="provider in Object.keys(groupedModels)" :key="provider">
                                     <optgroup :label="provider">
                                         <template x-for="m in groupedModels[provider]" :key="m.id">
@@ -426,13 +481,34 @@ const html = `<!DOCTYPE html>
                             </select>
                         </div>
 
+                        <div class="pt-3 border-t border-gray-800">
+                            <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Modelo Pesado — Variações</h4>
+                        </div>
+
                         <div>
-                            <label class="block text-sm font-bold text-gray-300 mb-1">Strategic Planner (Fallback Agent)</label>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Variação para Planejamento (Strategic Planner)</label>
+                            <p class="text-xs text-gray-500 mb-2">Variante pensante do modelo caro. Acionada em tarefas COMPLEX e em resgates mid-loop (escalonamento reativo). Ex.: GLM 5.3 Max.</p>
                             <select x-model="config.planner_model" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                                <option value="">— Herdar do agent.plan.model (fallback) —</option>
                                 <template x-for="provider in Object.keys(groupedModels)" :key="provider">
                                     <optgroup :label="provider">
                                         <template x-for="m in groupedModels[provider]" :key="m.id">
                                             <option :value="m.id" x-text="m.name" :selected="config.planner_model === m.id"></option>
+                                        </template>
+                                    </optgroup>
+                                </template>
+                            </select>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Variação para Codificação (Core Executor)</label>
+                            <p class="text-xs text-gray-500 mb-2">Variante executora do modelo caro para tarefas STANDARD. Vazio = seguir o modelo da sessão no TUI. Ex.: GLM 5.3 High.</p>
+                            <select x-model="config.coding_model" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                                <option value="">— Seguir modelo da sessão (TUI) —</option>
+                                <template x-for="provider in Object.keys(groupedModels)" :key="provider">
+                                    <optgroup :label="provider">
+                                        <template x-for="m in groupedModels[provider]" :key="m.id">
+                                            <option :value="m.id" x-text="m.name" :selected="config.coding_model === m.id"></option>
                                         </template>
                                     </optgroup>
                                 </template>
@@ -445,6 +521,35 @@ const html = `<!DOCTYPE html>
                         </button>
                         <p x-show="saveSuccess" class="text-green-400 text-xs text-center mt-2" x-transition>Configurações salvas!</p>
                     </form>
+                </div>
+
+                <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 shadow-sm">
+                    <h3 class="text-xl font-bold text-white mb-6 border-b border-gray-800 pb-2">Context Harvester (Micro-worker)</h3>
+
+                    <div class="mb-6">
+                        <h4 class="text-sm font-bold text-gray-300 mb-1">Ativar Harvester</h4>
+                        <p class="text-xs text-gray-500 mb-3">Outputs grandes de tools (> threshold) são comprimidos pelo Small Model em uma sessão-filha isolada. O texto bruto fica arquivado em jev_harvests.jsonl. Qualquer falha mantém o output original.</p>
+                        <button @click="state.harvester.enabled = !state.harvester.enabled; updateState()" class="relative inline-flex h-8 w-14 items-center rounded-full transition-colors focus:outline-none" :class="state.harvester.enabled ? 'bg-blue-600' : 'bg-gray-600'">
+                            <span class="inline-block h-6 w-6 transform rounded-full bg-white transition-transform" :class="state.harvester.enabled ? 'translate-x-7' : 'translate-x-1'"></span>
+                        </button>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Threshold (chars)</label>
+                            <p class="text-xs text-gray-500 mb-2">Só comprime outputs maiores que isso.</p>
+                            <input type="number" min="0" step="500" x-model.number="state.harvester.thresholdChars" @change="updateState" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-bold text-gray-300 mb-1">Timeout (ms)</label>
+                            <p class="text-xs text-gray-500 mb-2">Deadline rígido; estourou, mantém o bruto.</p>
+                            <input type="number" min="5000" step="1000" x-model.number="state.harvester.timeoutMs" @change="updateState" class="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white text-sm focus:border-blue-500 focus:outline-none">
+                        </div>
+                    </div>
+
+                    <div class="text-xs text-gray-500 border-t border-gray-800 pt-4">
+                        Harvests: <span class="font-mono text-emerald-400" x-text="state.stats?.harvests || 0"></span> · Chars economizados: <span class="font-mono text-emerald-400" x-text="state.stats?.charsSaved || 0"></span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -462,9 +567,10 @@ const html = `<!DOCTYPE html>
                     <div class="bg-gray-900 border border-gray-800 rounded-xl p-6">
                         <h4 class="text-lg font-bold text-blue-400 mb-3">Model Routing (Escalonamento Dinâmico)</h4>
                         <ul class="space-y-2 text-sm list-disc pl-5">
-                            <li><strong>TRIVIAL:</strong> Roteia para modelos pequenos e rápidos (ex: Nemotron, Gemini Flash) para tarefas como linting, formatação e perguntas simples.</li>
-                            <li><strong>STANDARD:</strong> Mantém o executor atual (ex: Claude Sonnet 4.6) para desenvolvimento regular de features.</li>
-                            <li><strong>COMPLEX:</strong> Aciona o Strategic Planner (ex: Claude Opus 4.6 Thinking) para arquitetura, debugging profundo e bloqueios sistemáticos.</li>
+                            <li><strong>TRIVIAL:</strong> Small Model Genérico — modelos baratos e rápidos para linting, formatação e perguntas simples.</li>
+                            <li><strong>STANDARD:</strong> Variação para Codificação do modelo pesado (ex.: GLM 5.3 High) — vazio, segue o modelo da sessão.</li>
+                            <li><strong>COMPLEX:</strong> Variação para Planejamento (ex.: GLM 5.3 Max) — arquitetura, debugging profundo e resgates mid-loop.</li>
+                            <li><strong>WRAP-UP:</strong> Após a sentinela [TAREFA_FINALIZADA], o Modelo Gerador de Texto barato escreve o relatório final.</li>
                         </ul>
                     </div>
 
@@ -487,8 +593,8 @@ const html = `<!DOCTYPE html>
         document.addEventListener('alpine:init', () => {
             Alpine.data('app', () => ({
                 currentTab: window.location.hash || '#dashboard',
-                state: { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, stats: { totalCalls: 0, models: {} } },
-                config: { openrouter_key: '', jev_model: '', small_model: '', planner_model: '', available_models: [] },
+                state: { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, harvester: { enabled: true, thresholdChars: 3000, timeoutMs: 25000 }, stats: { totalCalls: 0, models: {}, harvests: 0, charsSaved: 0 } },
+                config: { openrouter_key: '', jev_model: '', small_model: '', harvester_model: '', report_model: '', planner_model: '', coding_model: '', available_models: [] },
                 saving: false,
                 saveSuccess: false,
                 init() {
@@ -502,7 +608,8 @@ const html = `<!DOCTYPE html>
                     try {
                         const res = await fetch('/api/data');
                         const data = await res.json();
-                        this.state = { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, stats: { totalCalls: 0, models: {} }, ...data.state };
+                        this.state = { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, stats: { totalCalls: 0, models: {}, harvests: 0, charsSaved: 0 }, ...data.state };
+                        this.state.harvester = { enabled: true, thresholdChars: 3000, timeoutMs: 25000, ...(this.state.harvester || {}) };
                         this.config = data.config;
                     } catch(e) { console.error("Failed to load data", e); }
                 },
@@ -532,7 +639,10 @@ const html = `<!DOCTYPE html>
                             openrouter_key: this.config.openrouter_key,
                             jev_model: this.config.jev_model,
                             small_model: this.config.small_model,
-                            planner_model: this.config.planner_model
+                            harvester_model: this.config.harvester_model,
+                            report_model: this.config.report_model,
+                            planner_model: this.config.planner_model,
+                            coding_model: this.config.coding_model
                         };
                         const res = await fetch('/api/config', {
                             method: 'POST',
@@ -705,7 +815,10 @@ const server = http.createServer(async (req, res) => {
                 openrouter_key: safeKey,
                 jev_model: oc.decisionModel ?? "typesafe/jev-1.13",
                 small_model: oc.small_model ?? "",
-                planner_model: oc.agent?.plan?.model ?? "",
+                harvester_model: oc.jev?.harvesterModel ?? "",
+                report_model: oc.jev?.reportModel ?? "",
+                planner_model: oc.jev?.plannerModel ?? oc.agent?.plan?.model ?? "",
+                coding_model: oc.jev?.codingModel ?? "",
                 available_models: getAvailableModels(oc)
             }
         };

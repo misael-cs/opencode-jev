@@ -50,6 +50,19 @@ Consecutive failures (default: 2) trip a per-session escalation flag. On the ver
 
 ---
 
+### 7. Context Harvester (Micro-Worker Compression)
+Large tool outputs never reach the core model raw. When a tool returns more than a configurable threshold (default: 3,000 chars), JEV spawns an **isolated child session** running the configured Small Model, which compresses the log before it is injected into the reasoning loop:
+
+- **Preserves verbatim**: error messages, stack traces, exit codes, file paths, env var names, identifiers.
+- **Drops noise**: progress bars, spinner frames, repeated lines, banners, ANSI codes, raw HTML.
+- **Fail-safe**: on timeout (default 25s) or any error, the original raw output is kept untouched.
+
+The full raw output is archived to `~/.config/opencode/jev_harvests.jsonl` for audit, and stats (harvests, chars saved) are surfaced in the web dashboard. Configurable from the Settings tab: enable/disable, threshold, timeout.
+
+This is the AGENTS.md *Context Pruning Dinâmico Pós-Tool Call* policy applied by the Small Model listed in the JEV Dashboard — which in turn is populated dynamically from the models enabled in the OpenCode Desktop picker.
+
+---
+
 ## Prerequisites
 
 - [OpenCode](https://opencode.ai) installed and run at least once.

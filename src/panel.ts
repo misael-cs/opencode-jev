@@ -36,6 +36,12 @@ interface OpencodeConfig {
   small_model?: string;
   decisionModel?: string;
   disabled_providers?: string[];
+  jev?: {
+    harvesterModel?: string;
+    reportModel?: string;
+    plannerModel?: string;
+    codingModel?: string;
+  };
   agent?: {
     plan?: { model?: string };
   };
@@ -50,7 +56,10 @@ interface OpencodeConfig {
 
 interface SavePayload {
   small_model?: string;
+  harvester_model?: string;
+  report_model?: string;
   planner_model?: string;
+  coding_model?: string;
   jev_model?: string;
   openrouter_key?: string;
 }
@@ -115,8 +124,20 @@ async function saveConfig(configPath: string, updates: SavePayload): Promise<voi
     currentText = applyEdits(currentText, modify(currentText, ["small_model"], updates.small_model, options));
   }
 
-  if (updates.planner_model) {
-    currentText = applyEdits(currentText, modify(currentText, ["agent", "plan", "model"], updates.planner_model, options));
+  if (updates.harvester_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "harvesterModel"], updates.harvester_model, options));
+  }
+
+  if (updates.report_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "reportModel"], updates.report_model, options));
+  }
+
+  if (updates.planner_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "plannerModel"], updates.planner_model, options));
+  }
+
+  if (updates.coding_model !== undefined) {
+    currentText = applyEdits(currentText, modify(currentText, ["jev", "codingModel"], updates.coding_model, options));
   }
 
   if (updates.jev_model) {
@@ -210,7 +231,13 @@ function getAvailableModels(config: OpencodeConfig): ModelEntry[] {
   }
 
   // Keep currently saved models even if not in list
-  const currentModels = [config.small_model, config.agent?.plan?.model];
+  const currentModels = [
+    config.small_model,
+    config.jev?.harvesterModel,
+    config.jev?.reportModel,
+    config.jev?.plannerModel ?? config.agent?.plan?.model,
+    config.jev?.codingModel,
+  ];
   for (const m of currentModels) {
     if (m && !all.find((x) => x.id === m || `${x.id}-Free` === m)) {
       all.push({ id: m, name: `${m} (implícito/externo)`, provider: "Outros" });
@@ -274,9 +301,10 @@ function renderPanel(config: OpencodeConfig): string {
 <body>
   <h2>JEV Orchestrator — Control Panel</h2>
   <div class="notice">
-    The <strong>Core Worker</strong> (primary model) is not managed here.
-    Change it freely in the OpenCode TUI. Use this panel only to govern the
-    auxiliary and background orchestration layers.
+    The <strong>Core Worker</strong> follows the session model in the OpenCode TUI,
+    unless a <strong>Coding Variant</strong> is selected below — then JEV governs it.
+    Small models are specialized by role: <strong>Harvester</strong> collects,
+    <strong>Text Generator</strong> writes, the generic <strong>Small Model</strong> is the fallback.
   </div>
   <form id="configForm">
     <label>OpenRouter API Key
@@ -289,17 +317,43 @@ function renderPanel(config: OpencodeConfig): string {
       <input type="text" name="jev_model" value="${config.decisionModel ?? "typesafe/jev-1.13"}" readonly title="Fixed for OpenRouter/Typesafe integration.">
     </label>
 
-    <label>Context Harvester / Scraper (Small Model)
-      <p class="desc">Reads massive logs, global scans — high speed and low cost.</p>
+    <label>Modelo Harvester (Coletor)
+      <p class="desc">Comprime outputs gigantes de tools (logs, scans). Otimizado para extração verbatim em alta velocidade. Vazio = herda do Small Model.</p>
+      <select name="harvester_model">
+        <option value="">— Herdar do Small Model (fallback) —</option>
+        ${buildSelectOptions(models, config.jev?.harvesterModel)}
+      </select>
+    </label>
+
+    <label>Modelo Gerador de Texto (Wrap-up)
+      <p class="desc">Escreve o relatório final rich text após a sentinela [TAREFA_FINALIZADA] (desescalada). Otimizado para prosa, Markdown e HTML. Vazio = herda do Small Model.</p>
+      <select name="report_model">
+        <option value="">— Herdar do Small Model (fallback) —</option>
+        ${buildSelectOptions(models, config.jev?.reportModel)}
+      </select>
+    </label>
+
+    <label>Small Model Genérico (Fallback)
+      <p class="desc">Fallback dos papéis acima e executor de tarefas TRIVIAIS (formatação, perguntas simples).</p>
       <select name="small_model">
+        <option value="">— Nenhum (desativado) —</option>
         ${buildSelectOptions(models, config.small_model)}
       </select>
     </label>
 
-    <label>Strategic Planner (Fallback Agent)
-      <p class="desc">Rescue actor activated by JEV for architecture decisions or stuck loops.</p>
+    <label>Modelo Pesado — Variação para Planejamento
+      <p class="desc">Variante pensante (ex.: GLM 5.3 Max). Acionada em tarefas COMPLEX e resgates mid-loop. Vazio = herda do agent.plan.model.</p>
       <select name="planner_model">
-        ${buildSelectOptions(models, config.agent?.plan?.model)}
+        <option value="">— Herdar do agent.plan.model (fallback) —</option>
+        ${buildSelectOptions(models, config.jev?.plannerModel ?? config.agent?.plan?.model)}
+      </select>
+    </label>
+
+    <label>Modelo Pesado — Variação para Codificação
+      <p class="desc">Variante executora (ex.: GLM 5.3 High) para tarefas STANDARD. Vazio = seguir o modelo da sessão no OpenCode TUI.</p>
+      <select name="coding_model">
+        <option value="">— Seguir modelo da sessão (TUI) —</option>
+        ${buildSelectOptions(models, config.jev?.codingModel)}
       </select>
     </label>
 

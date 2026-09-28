@@ -1,20 +1,13 @@
 #!/usr/bin/env node
 import fs from "fs";
-import os from "os";
+import { applyEdits, type ModificationOptions, modify, parse } from "jsonc-parser";
 import path from "path";
 import readline from "readline";
-import { parse, modify, applyEdits, ModificationOptions } from "jsonc-parser";
+import { getOpencodeConfigDir } from "../src/shared.js";
 
 // ---------------------------------------------------------------------------
 // Cross-platform path resolution
 // ---------------------------------------------------------------------------
-
-function getOpencodeConfigDir(): string {
-  const xdg = process.env.XDG_CONFIG_HOME;
-  return xdg
-    ? path.join(xdg, "opencode")
-    : path.join(os.homedir(), ".config", "opencode");
-}
 
 function getOpencodeAgentDir(): string {
   return path.join(getOpencodeConfigDir(), "agent");
@@ -23,11 +16,6 @@ function getOpencodeAgentDir(): string {
 // ---------------------------------------------------------------------------
 // JSONC helpers
 // ---------------------------------------------------------------------------
-
-function readJsonc(filePath: string): Record<string, unknown> {
-  const raw = fs.readFileSync(filePath, "utf8");
-  return parse(raw) as Record<string, unknown>;
-}
 
 // ---------------------------------------------------------------------------
 // Prompt helper
@@ -87,7 +75,7 @@ async function install(): Promise<void> {
   // 1. Verify opencode.jsonc exists
   if (!fs.existsSync(configPath)) {
     console.error(
-      `opencode.jsonc not found at ${configPath}.\nMake sure OpenCode is installed and has been run at least once.`
+      `opencode.jsonc not found at ${configPath}.\nMake sure OpenCode is installed and has been run at least once.`,
     );
     process.exit(1);
   }
@@ -106,24 +94,23 @@ async function install(): Promise<void> {
     console.log(`[✓] Plugin entry already present in opencode.jsonc.`);
   } else {
     pluginArray.push(pluginEntry);
-    currentConfigText = applyEdits(currentConfigText, modify(currentConfigText, ["plugin"], pluginArray, formattingOptions));
+    currentConfigText = applyEdits(
+      currentConfigText,
+      modify(currentConfigText, ["plugin"], pluginArray, formattingOptions),
+    );
     console.log(`[+] Added "${pluginEntry}" to plugin array.`);
   }
 
   // 3. Prompt for OpenRouter API key
   const existingKey = (
-    (config.provider as Record<string, unknown> | undefined)
-      ?.openrouter as Record<string, unknown> | undefined
+    (config.provider as Record<string, unknown> | undefined)?.openrouter as Record<string, unknown> | undefined
   )?.options as Record<string, string> | undefined;
 
-  const hasKey =
-    existingKey?.apiKey && !existingKey.apiKey.startsWith("{env:");
+  const hasKey = existingKey?.apiKey && !existingKey.apiKey.startsWith("{env:");
 
   let apiKey = "";
   if (hasKey) {
-    const overwrite = await prompt(
-      "OpenRouter API key already configured. Overwrite? [y/N]: "
-    );
+    const overwrite = await prompt("OpenRouter API key already configured. Overwrite? [y/N]: ");
     if (overwrite.trim().toLowerCase() === "y") {
       apiKey = await prompt("Enter your OpenRouter API key (sk-or-v1-...): ", true);
     }
@@ -132,7 +119,10 @@ async function install(): Promise<void> {
   }
 
   if (apiKey.trim()) {
-    currentConfigText = applyEdits(currentConfigText, modify(currentConfigText, ["provider", "openrouter", "options", "apiKey"], apiKey.trim(), formattingOptions));
+    currentConfigText = applyEdits(
+      currentConfigText,
+      modify(currentConfigText, ["provider", "openrouter", "options", "apiKey"], apiKey.trim(), formattingOptions),
+    );
     console.log(`[+] OpenRouter API key saved.`);
   }
 
@@ -178,8 +168,13 @@ async function uninstall(): Promise<void> {
     const configText = fs.readFileSync(configPath, "utf8");
     const config = parse(configText) || {};
     let pluginArray = (config.plugin as string[] | undefined) ?? [];
-    pluginArray = pluginArray.filter((p) => p !== "@misaelcs/opencode-jev" && p !== "opencode-jev-orchestrator" && p !== "opencode-jev");
-    const newConfigText = applyEdits(configText, modify(configText, ["plugin"], pluginArray, { formattingOptions: { insertSpaces: true, tabSize: 2 } }));
+    pluginArray = pluginArray.filter(
+      (p) => p !== "@misaelcs/opencode-jev" && p !== "opencode-jev-orchestrator" && p !== "opencode-jev",
+    );
+    const newConfigText = applyEdits(
+      configText,
+      modify(configText, ["plugin"], pluginArray, { formattingOptions: { insertSpaces: true, tabSize: 2 } }),
+    );
     fs.writeFileSync(configPath, newConfigText, "utf8");
     console.log(`[✓] Removed "@misaelcs/opencode-jev" from plugin array.`);
   }
@@ -213,7 +208,7 @@ async function scan(): Promise<void> {
   const targetPath = process.argv[4] || ".";
 
   if (!question) {
-    console.error("Usage: npx opencode-jev scan \"your question\" [path]");
+    console.error('Usage: npx opencode-jev scan "your question" [path]');
     process.exit(1);
   }
 
@@ -228,13 +223,13 @@ async function scan(): Promise<void> {
 async function context(): Promise<void> {
   const data = process.argv[3];
   if (!data) {
-    console.error("Usage: npx opencode-jev context \"Your summary here\"");
+    console.error('Usage: npx opencode-jev context "Your summary here"');
     process.exit(1);
   }
 
   const workspaceDir = process.cwd();
   const opencodeDir = path.join(workspaceDir, ".opencode");
-  
+
   if (!fs.existsSync(opencodeDir)) {
     fs.mkdirSync(opencodeDir, { recursive: true });
   }
@@ -292,19 +287,34 @@ const command = process.argv[2];
 
 switch (command) {
   case "install":
-    install().catch((e) => { console.error(e); process.exit(1); });
+    install().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
     break;
   case "uninstall":
-    uninstall().catch((e) => { console.error(e); process.exit(1); });
+    uninstall().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
     break;
   case "panel":
-    panel().catch((e) => { console.error(e); process.exit(1); });
+    panel().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
     break;
   case "scan":
-    scan().catch((e) => { console.error(e); process.exit(1); });
+    scan().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
     break;
   case "context":
-    context().catch((e) => { console.error(e); process.exit(1); });
+    context().catch((e) => {
+      console.error(e);
+      process.exit(1);
+    });
     break;
   case "--help":
   case "-h":

@@ -23,11 +23,7 @@ interface NoulResponse {
 // Threshold: file is considered a match when relevance probability > 0.72
 const NOUL_RELEVANCE_THRESHOLD = 0.72;
 
-async function askJev(
-  apiKey: string,
-  query: string,
-  fileContent: string
-): Promise<number> {
+async function askJev(apiKey: string, query: string, fileContent: string): Promise<number> {
   try {
     const response = await fetch("https://openrouter.ai/api/alpha/decisions", {
       method: "POST",
@@ -49,7 +45,8 @@ async function askJev(
               "Does the file_content contain information that answers, matches, or is directly relevant to the search_query?",
             criteria: {
               true: "The file contains code, configuration, documentation, or data that directly relates to or answers the search_query.",
-              false: "The file does not contain relevant information for the search_query, or the content is completely unrelated.",
+              false:
+                "The file does not contain relevant information for the search_query, or the content is completely unrelated.",
             },
           },
         },
@@ -77,11 +74,33 @@ async function askJev(
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", ".next", "build", "__pycache__", ".venv", "venv"]);
 const BINARY_EXTS = new Set([
-  ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-  ".pdf", ".zip", ".tar", ".gz", ".7z", ".rar",
-  ".mp4", ".mp3", ".wav", ".avi", ".mov",
-  ".exe", ".dll", ".so", ".dylib", ".bin",
-  ".woff", ".woff2", ".ttf", ".eot",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".svg",
+  ".ico",
+  ".pdf",
+  ".zip",
+  ".tar",
+  ".gz",
+  ".7z",
+  ".rar",
+  ".mp4",
+  ".mp3",
+  ".wav",
+  ".avi",
+  ".mov",
+  ".exe",
+  ".dll",
+  ".so",
+  ".dylib",
+  ".bin",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".eot",
 ]);
 
 function getFilesRecursively(dir: string, fileList: string[] = []): string[] {
@@ -135,9 +154,7 @@ const MAX_MATCHES = 3;
 export async function runScan(query: string, targetPath: string): Promise<void> {
   const apiKey = resolveApiKey();
   if (!apiKey) {
-    console.error(
-      "Error: OpenRouter API key not found. Configure it with `opencode-jev panel`."
-    );
+    console.error("Error: OpenRouter API key not found. Configure it with `opencode-jev panel`.");
     process.exit(1);
   }
 
@@ -181,9 +198,7 @@ export async function runScan(query: string, targetPath: string): Promise<void> 
     }
 
     if (foundMatches >= MAX_MATCHES) {
-      console.log(
-        `\nStopped early: ${foundMatches} matches found. Read these files to continue.`
-      );
+      console.log(`\nStopped early: ${foundMatches} matches found. Read these files to continue.`);
       return;
     }
   }

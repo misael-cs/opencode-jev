@@ -14,6 +14,12 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "lint": "biome check",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "check": "biome check --write && npm run typecheck",
+    "test": "vitest run",
+    "dev": "tsx watch bin/cli.ts panel",
+    "changeset": "changeset",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -37,8 +43,12 @@
     }
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "typescript": "^5.5.0"
+    "@biomejs/biome": "^2.5.14",
+    "@changesets/cli": "^3.0.3",
+    "@types/node": "^22.20.4",
+    "tsx": "^4.23.15",
+    "typescript": "^5.5.0",
+    "vitest": "^5.0.2"
   },
   "engines": {
     "node": ">=18"

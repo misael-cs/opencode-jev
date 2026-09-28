@@ -1,17 +1,20 @@
+import { spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { buildDynamicCriteria } from "./catalog.js";
 import {
+  COMPLEX_THRESHOLD,
   CONFIG_DIR,
-  log,
-  getLocalTimestamp,
-  resolveApiKey,
-  readOpencodeConfig,
+  ESCALATION_FAILURE_THRESHOLD,
+  FAILURE_WINDOW_MS,
+  isToolSafeReadonly,
   parseModelString,
-} from "./utils.js";
+  sampleForHarvest,
+  TRIVIAL_THRESHOLD,
+} from "./shared.js";
+import { getLocalTimestamp, log, readOpencodeConfig, resolveApiKey } from "./utils.js";
 
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -91,14 +94,6 @@ const WRAPUP_DIRECTIVE =
   `what was done, files changed, commands run, and results, in clear formatted Markdown.\n` +
   `Do NOT call any tools. Do NOT modify any files. Do NOT emit the completion token.`;
 
-// Complexity routing thresholds
-// score: 0 (trivial) → 1 (standard) → 2 (complex)
-const TRIVIAL_THRESHOLD = 0.6;
-const COMPLEX_THRESHOLD = 1.5;
-
-const ESCALATION_FAILURE_THRESHOLD = 2;  // failures before forcing planner
-const FAILURE_WINDOW_MS = 5 * 60 * 1000; // reset counter after 5 min idle
-
 // ---------------------------------------------------------------------------
 // Unified per-session state (JevSessionContext)
 // Single source of truth captured at chat.message (original intent) and
@@ -121,23 +116,23 @@ interface JevSessionContext {
   // --- Routing decision (recomputed on each real user message) ---
   domain: string;
   domainConfidence: number;
-  complexityScore: number;        // 0.0 = trivial → 1.0 = standard → 2.0 = complex
+  complexityScore: number; // 0.0 = trivial → 1.0 = standard → 2.0 = complex
   complexityConfidence: number;
   targetModel: "small" | "core" | "planner";
   targetModelStr: string;
   hasRouting: boolean;
 
   // --- Guardrail / reactive escalation ---
-  failureCount: number;           // consecutive failed tool calls
+  failureCount: number; // consecutive failed tool calls
   lastFailureTimestamp: number;
-  forceEscalate: boolean;         // true → next LLM call routes to planner
-  blockedToolCalls: number;       // total guardrail blocks this session
-  recentTools: ToolTrace[];       // last tool calls (context for wrap-up audit)
+  forceEscalate: boolean; // true → next LLM call routes to planner
+  blockedToolCalls: number; // total guardrail blocks this session
+  recentTools: ToolTrace[]; // last tool calls (context for wrap-up audit)
 
   // --- Lifecycle ---
   status: JevSessionStatus;
-  wrapUpActive: boolean;          // wrap-up auto-continue cycle in flight
-  timestamp: number;              // last activity (for pruning)
+  wrapUpActive: boolean; // wrap-up auto-continue cycle in flight
+  timestamp: number; // last activity (for pruning)
 }
 
 const sessionContexts = new Map<string, JevSessionContext>();
@@ -214,7 +209,7 @@ function resolveTargetModel(
   smallModel: string,
   plannerModel: string,
   codingModel: string,
-  sessionModel: string
+  sessionModel: string,
 ): { target: "small" | "core" | "planner"; modelStr: string } {
   // Coding variant of the heavy model — governs the CORE executor when
   // configured; falls back to the session's model otherwise.
@@ -249,7 +244,7 @@ function isProviderUsable(providerID: string, config: Record<string, unknown> | 
 async function jevRequest(
   apiKey: string,
   state: unknown,
-  questions: Record<string, unknown>
+  questions: Record<string, unknown>,
 ): Promise<JevAnswers | null> {
   const MAX_RETRIES = 2;
 
@@ -294,7 +289,7 @@ async function queryJevRouting(
   messageText: string,
   sessionID: string,
   currentModel: string,
-  availableTools: string[]
+  availableTools: string[],
 ): Promise<JevAnswers | null> {
   const mcpConfig = readOpencodeConfig()?.mcp as Record<string, unknown> | undefined;
   const criteria = buildDynamicCriteria(mcpConfig);
@@ -339,7 +334,7 @@ async function queryJevRouting(
           domainConf: (answers.next_tool_domain as JevChoiceAnswer)?.confidence,
           complexityScore: (answers.task_complexity as JevScoreAnswer)?.score,
           complexityConf: (answers.task_complexity as JevScoreAnswer)?.confidence,
-        }) + "\n"
+        }) + "\n",
       );
     } catch (_) {}
   }
@@ -358,105 +353,10 @@ async function queryJevRouting(
 // JEV understands what any tool call means from the names and arguments alone.
 // ---------------------------------------------------------------------------
 
-// Tools that are inherently read-only and carry no destructive potential.
-// We skip JEV for these to avoid unnecessary latency on safe operations.
-//
-// DESIGN PRINCIPLE: this is a skip-list, never an allow-list.
-// A false positive here (skipping a dangerous tool) is unsafe.
-// A false negative (checking a safe tool with JEV) only costs one API call.
-// When in doubt, we CHECK with JEV.
-const SAFE_EXACT_NAMES = new Set([
-  // OpenCode built-in read/workflow tools (zero destructive potential)
-  "read", "list", "glob", "grep", "find", "webfetch",
-  "todowrite", "todoread", "question",
-]);
-
-// Verbs that unambiguously indicate a read-only operation.
-const READONLY_VERBS = [
-  "list", "get", "read", "search", "fetch", "view", "show",
-  "describe", "inspect", "peek", "ping",
-];
-
-// Verbs that indicate a mutation. If any of these appears as a whole word in
-// the tool name, the tool is NEVER skipped — JEV assesses it.
-const WRITE_VERBS = new Set([
-  "create", "delete", "update", "set", "put", "post", "patch", "drop",
-  "remove", "write", "edit", "modify", "insert", "upsert", "destroy",
-  "purge", "wipe", "reset", "restart", "stop", "start", "kill", "terminate",
-  "reboot", "recreate", "install", "uninstall", "deploy", "move", "rename",
-  "copy", "upload", "push", "commit", "merge", "revert", "apply", "run",
-  "execute", "send", "publish", "grant", "revoke", "enable", "disable",
-  "block", "ban", "mute", "approve", "reject", "cancel", "close", "open",
-  "add", "append", "attach", "detach", "build", "save", "launch", "shutdown",
-  "sync", "seed", "migrate", "rollback", "schedule", "trigger", "invoke",
-  "replace", "submit", "notify", "alert", "email", "broadcast", "transmit",
-  "activate", "deactivate", "associate", "disassociate", "bind", "unbind",
-  "lock", "unlock", "freeze", "thaw", "flush", "invalidate", "expire",
-  "renew", "resize", "scale", "upgrade", "downgrade", "archive", "unarchive",
-  "export", "import", "generate", "process", "convert", "queue", "clear",
-]);
-
-// Split a tool name into lowercase words, respecting separators AND camelCase.
-// "agency-hosting_getWebsiteSetupStatusV1" → [agency, hosting, get, website, setup, status, v1]
-function extractWords(toolName: string): string[] {
-  const words: string[] = [];
-  for (const segment of toolName.split(/[_\-\s.]+/).filter(Boolean)) {
-    const camelSplit = segment
-      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-      .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
-    for (const word of camelSplit.split(/\s+/)) {
-      if (word) words.push(word.toLowerCase());
-    }
-  }
-  return words;
-}
-
-function isToolSafeReadonly(toolName: string): boolean {
-  const raw = toolName.trim();
-  const lower = raw.toLowerCase();
-
-  if (SAFE_EXACT_NAMES.has(lower)) return true;
-
-  // 1) Compound operation names are never skipped: "get_or_create",
-  //    "search-and-replace", "fetch then remove" — multiple actions implied.
-  if (/(^|[_\-\s])(and|or|then)([_\-\s]|$)/i.test(raw)) return false;
-
-  // 2) Word-based write-verb veto.
-  //    "setup" is not "set" and "postgres" is not "post" — only whole words count.
-  const words = extractWords(raw);
-  if (words.some((w) => WRITE_VERBS.has(w))) return false;
-
-  // 3) Fully concatenated lowercase names ("getuseranddelete") can hide verbs
-  //    with no word boundaries — apply a coarse substring veto there.
-  const concatenated = !/[_\-\s.]/.test(raw) && raw === lower;
-  if (concatenated && Array.from(WRITE_VERBS).some((v) => v.length > 3 && lower.includes(v))) {
-    return false;
-  }
-
-  // 4) Skip only when a candidate name STARTS with a read-only verb word.
-  //    Candidates: full name, then name minus 1 and minus 2 leading segments
-  //    (server prefixes such as "hosting_", "vps_VPS_", "agency-hosting_").
-  const segments = raw.split(/[_\-\s.]+/).filter(Boolean);
-  const candidates: string[] = [segments.join(" ")];
-  let remaining = segments;
-  for (let i = 0; i < 2 && remaining.length > 1; i++) {
-    remaining = remaining.slice(1);
-    candidates.push(remaining.join(" "));
-  }
-
-  return candidates.some((candidate) => {
-    const firstWord = extractWords(candidate)[0];
-    if (!firstWord) return false;
-    return READONLY_VERBS.some(
-      (verb) => firstWord === verb || firstWord.startsWith(verb)
-    );
-  });
-}
-
 async function queryJevGuardrail(
   apiKey: string,
   tool: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
 ): Promise<{ isDangerous: number } | null> {
   // Generic polyvalent state: works for bash, write, edit, AND any MCP tool.
   // JEV receives the full tool name and serialized args — enough semantic
@@ -473,7 +373,8 @@ async function queryJevGuardrail(
         "Could this tool call cause data loss, modify or delete production systems, expose credentials, or perform an irreversible destructive action?",
       criteria: {
         true: "Tool call deletes or overwrites files/directories, drops databases, destroys VPS/hosting instances, wipes DNS records, deletes websites or domains, runs destructive shell commands (rm -rf, format, DROP TABLE), exposes API keys or credentials, modifies OS/system configuration, or performs any action that cannot be easily undone.",
-        false: "Tool call reads or lists data, creates new resources without affecting existing ones, installs project-local packages, runs tests, starts development servers, or performs standard reversible development operations.",
+        false:
+          "Tool call reads or lists data, creates new resources without affecting existing ones, installs project-local packages, runs tests, starts development servers, or performs standard reversible development operations.",
       },
     },
   });
@@ -495,7 +396,7 @@ async function queryJevFailureDetect(
   tool: string,
   toolTitle: string,
   toolArgs: unknown,
-  toolOutput: string
+  toolOutput: string,
 ): Promise<{ isFailure: number } | null> {
   const state = {
     tool_name: tool,
@@ -511,7 +412,8 @@ async function queryJevFailureDetect(
         "Does this tool output indicate an error, failure, or unexpected result that the agent needs to address?",
       criteria: {
         true: "Output contains error messages, stack traces, non-zero exit codes, build failures, test failures, unhandled exceptions, permission denied errors, command not found, API error responses, rejected operations, or syntax errors.",
-        false: "Output shows successful execution, expected results, normal warnings that don't indicate failure, or empty output from commands that normally produce none.",
+        false:
+          "Output shows successful execution, expected results, normal warnings that don't indicate failure, or empty output from commands that normally produce none.",
       },
     },
   });
@@ -528,10 +430,7 @@ async function queryJevFailureDetect(
 // cheap primary trigger; this noul double-checks it before de-escalating.
 // ---------------------------------------------------------------------------
 
-async function queryJevWrapUpAudit(
-  apiKey: string,
-  ctx: JevSessionContext
-): Promise<{ isComplete: number } | null> {
+async function queryJevWrapUpAudit(apiKey: string, ctx: JevSessionContext): Promise<{ isComplete: number } | null> {
   const state = {
     user_request: ctx.originalRequest.substring(0, 1500),
     agent_signal: TASK_COMPLETE_TOKEN,
@@ -546,7 +445,8 @@ async function queryJevWrapUpAudit(
         "The executor agent has just signaled that the requested task is fully finished. Based on the original request, recent tool activity, and failure count, is the task genuinely complete?",
       criteria: {
         true: "The original user request has been fully satisfied: required changes or outputs were produced, verifications succeeded, recent tools confirm the work, and no failures are pending.",
-        false: "Work appears unfinished: the request was only partially addressed, recent tools show errors or unresolved failures, or the completion signal contradicts the evidence.",
+        false:
+          "Work appears unfinished: the request was only partially addressed, recent tools show errors or unresolved failures, or the completion signal contradicts the evidence.",
       },
     },
   });
@@ -580,8 +480,8 @@ async function triggerWrapUp(client: any, sessionID: string): Promise<void> {
   const modelToUse = reportUsable
     ? parsedReport
     : fallback && isProviderUsable(fallback.providerID, config)
-    ? fallback
-    : null;
+      ? fallback
+      : null;
 
   if (!modelToUse) {
     log("WRAP-UP aborted: no usable model found for the report cycle.");
@@ -593,7 +493,7 @@ async function triggerWrapUp(client: any, sessionID: string): Promise<void> {
 
   log(
     `WRAP-UP: auto-continue on session ${sessionID} → ` +
-    `${modelToUse.providerID}/${modelToUse.modelID} (${reportUsable ? "report_model" : "fallback core"})`
+      `${modelToUse.providerID}/${modelToUse.modelID} (${reportUsable ? "report_model" : "fallback core"})`,
   );
 
   try {
@@ -606,7 +506,7 @@ async function triggerWrapUp(client: any, sessionID: string): Promise<void> {
         request: `[WRAP-UP] report cycle → ${modelToUse.providerID}/${modelToUse.modelID}`,
         domain: "WRAP_UP",
         domainConf: 1,
-      }) + "\n"
+      }) + "\n",
     );
   } catch (_) {}
 
@@ -636,9 +536,9 @@ async function triggerWrapUp(client: any, sessionID: string): Promise<void> {
 
 interface HarvesterConfig {
   enabled: boolean;
-  thresholdChars: number;   // only outputs >= this are harvested
-  maxInputChars: number;    // cap of raw text sent to the small model
-  timeoutMs: number;        // hard deadline; on timeout the raw output is kept
+  thresholdChars: number; // only outputs >= this are harvested
+  maxInputChars: number; // cap of raw text sent to the small model
+  timeoutMs: number; // hard deadline; on timeout the raw output is kept
 }
 
 const HARVESTER_DEFAULTS: HarvesterConfig = {
@@ -658,29 +558,29 @@ const harvestSessionIds = new Set<string>();
 
 // Tools whose output is structured content (files, todos), not execution logs.
 const HARVEST_SKIP_TOOLS = new Set([
-  "read", "glob", "grep", "list", "todoread", "todowrite", "question", "edit", "write",
+  "read",
+  "glob",
+  "grep",
+  "list",
+  "todoread",
+  "todowrite",
+  "question",
+  "edit",
+  "write",
 ]);
 
 const HARVEST_SYSTEM_PROMPT = [
   "You are JEV-HARVESTER, a deterministic micro-worker that compresses raw tool output before it reaches the primary reasoning model.",
   "Rules (strict):",
   "- Preserve VERBATIM: error messages, stack traces, exit codes, file paths, env var names, command lines, identifiers.",
-  "- Drop noise: progress bars, spinner frames, repeated lines (emit \"[...N similar lines omitted]\"), banners, ANSI escape codes, raw HTML.",
+  '- Drop noise: progress bars, spinner frames, repeated lines (emit "[...N similar lines omitted]"), banners, ANSI escape codes, raw HTML.',
   "- Output format (plain text, no markdown fences):",
   "  STATUS: success | failure | ambiguous",
-  "  ERRORS: <exact error lines, or \"none\">",
+  '  ERRORS: <exact error lines, or "none">',
   "  SUMMARY: <1-5 compact lines>",
   "  KEY DATA: <essential values/paths/json projections>",
   "- Hard cap ~40 lines. Never invent content. Never call tools. Reply with the compressed text only.",
 ].join("\n");
-
-// Error/result text usually lives at the tail of logs; sample head+center/head-out.
-function sampleForHarvest(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  const head = Math.min(2000, Math.floor(maxChars * 0.2));
-  const tail = maxChars - head;
-  return `${text.slice(0, head)}\n[...middle ${text.length - maxChars} chars sampled out...]\n${text.slice(-tail)}`;
-}
 
 async function harvestToolOutput(
   client: any,
@@ -689,11 +589,17 @@ async function harvestToolOutput(
   args: unknown,
   rawOutput: string,
   smallModel: string,
-  cfg: HarvesterConfig
+  cfg: HarvesterConfig,
 ): Promise<string | null> {
-  if (!client?.session) { log("HARVEST skipped: no OpenCode client in plugin context."); return null; }
+  if (!client?.session) {
+    log("HARVEST skipped: no OpenCode client in plugin context.");
+    return null;
+  }
   const parsedModel = parseModelString(smallModel);
-  if (!parsedModel) { log(`HARVEST skipped: invalid harvester_model "${smallModel}"`); return null; }
+  if (!parsedModel) {
+    log(`HARVEST skipped: invalid harvester_model "${smallModel}"`);
+    return null;
+  }
 
   const payload = sampleForHarvest(rawOutput, cfg.maxInputChars);
   const argsPreview = args ? JSON.stringify(args).substring(0, 500) : "";
@@ -714,10 +620,12 @@ async function harvestToolOutput(
       body: {
         model: { providerID: parsedModel.providerID, modelID: parsedModel.modelID },
         system: HARVEST_SYSTEM_PROMPT,
-        parts: [{
-          type: "text",
-          text: `TOOL: ${tool}\nARGS: ${argsPreview}\n--- RAW OUTPUT (${rawOutput.length} chars) ---\n${payload}`,
-        }],
+        parts: [
+          {
+            type: "text",
+            text: `TOOL: ${tool}\nARGS: ${argsPreview}\n--- RAW OUTPUT (${rawOutput.length} chars) ---\n${payload}`,
+          },
+        ],
       },
     });
     if (resp?.error) throw new Error(JSON.stringify(resp.error));
@@ -733,7 +641,7 @@ async function harvestToolOutput(
   };
 
   const timeout = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error(`harvest timeout after ${cfg.timeoutMs}ms`)), cfg.timeoutMs)
+    setTimeout(() => reject(new Error(`harvest timeout after ${cfg.timeoutMs}ms`)), cfg.timeoutMs),
   );
 
   try {
@@ -745,7 +653,9 @@ async function harvestToolOutput(
     return null;
   } finally {
     if (childID) {
-      try { await client.session.delete({ path: { id: childID } }); } catch (_) {}
+      try {
+        await client.session.delete({ path: { id: childID } });
+      } catch (_) {}
     }
   }
 }
@@ -778,11 +688,11 @@ function readJevState(): Record<string, any> {
 // ---------------------------------------------------------------------------
 
 interface JevModelConfig {
-  smallModel: string;      // generic small fallback (small_model)
-  harvesterModel: string;  // coletor
-  reportModel: string;     // gerador de texto (wrap-up)
-  plannerModel: string;    // heavy: planning variant
-  codingModel: string;     // heavy: coding variant
+  smallModel: string; // generic small fallback (small_model)
+  harvesterModel: string; // coletor
+  reportModel: string; // gerador de texto (wrap-up)
+  plannerModel: string; // heavy: planning variant
+  codingModel: string; // heavy: coding variant
 }
 
 function readJevModels(): JevModelConfig {
@@ -793,10 +703,7 @@ function readJevModels(): JevModelConfig {
     smallModel,
     harvesterModel: (jev.harvesterModel as string) || smallModel,
     reportModel: (jev.reportModel as string) || smallModel,
-    plannerModel:
-      (jev.plannerModel as string) ||
-      ((config?.agent as any)?.plan?.model as string) ||
-      "",
+    plannerModel: (jev.plannerModel as string) || ((config?.agent as any)?.plan?.model as string) || "",
     codingModel: (jev.codingModel as string) || "",
   };
 }
@@ -816,7 +723,7 @@ function extractMessageFromEvent(properties: any): any | null {
 // Plugin export
 // ---------------------------------------------------------------------------
 
-export default (async (ctx: unknown) => {
+export default async (ctx: unknown) => {
   const client = (ctx as any)?.client;
 
   // Autostart web dashboard silently
@@ -837,7 +744,7 @@ export default (async (ctx: unknown) => {
     // chat.message's role=assistant branch) and, on session.idle, checks for
     // the completion token. Token + Noul audit → de-escalation (wrap-up).
     // -------------------------------------------------------------------------
-    "event": async ({ event }: { event: { type: string; properties?: any } }) => {
+    event: async ({ event }: { event: { type: string; properties?: any } }) => {
       try {
         if (event.type === "message.updated" || event.type === "message.part.updated") {
           const msg = extractMessageFromEvent(event.properties);
@@ -861,8 +768,7 @@ export default (async (ctx: unknown) => {
         }
 
         if (event.type === "session.idle") {
-          const sessionID =
-            event.properties?.sessionID ?? event.properties?.id ?? event.properties?.session?.id;
+          const sessionID = event.properties?.sessionID ?? event.properties?.id ?? event.properties?.session?.id;
           if (!sessionID || harvestSessionIds.has(sessionID)) return;
 
           const jevState = readJevState();
@@ -902,7 +808,7 @@ export default (async (ctx: unknown) => {
                     sessionID,
                     isComplete: audit.isComplete,
                     accepted: audit.isComplete >= 0.5,
-                  }) + "\n"
+                  }) + "\n",
                 );
               } catch (_) {}
 
@@ -948,7 +854,7 @@ export default (async (ctx: unknown) => {
           tools?: Record<string, boolean>;
         };
         parts: Array<{ type: string; text?: string; [key: string]: unknown }>;
-      }
+      },
     ) => {
       try {
         pruneCache();
@@ -956,7 +862,10 @@ export default (async (ctx: unknown) => {
         log(`--- chat.message | session: ${input.sessionID} ---`);
 
         const jevState = readJevState();
-        if (jevState.enabled !== true) { log("Bypass: JEV disabled."); return; }
+        if (jevState.enabled !== true) {
+          log("Bypass: JEV disabled.");
+          return;
+        }
 
         // --- Sentinel tracker: assistant messages are captured, not classified.
         if (output.message?.role === "assistant") {
@@ -978,9 +887,15 @@ export default (async (ctx: unknown) => {
           .filter((p) => p.type === "text" && typeof p.text === "string")
           .map((p) => p.text as string);
 
-        if (!textParts.length) { log("Bypass: no text parts."); return; }
+        if (!textParts.length) {
+          log("Bypass: no text parts.");
+          return;
+        }
         const messageText = textParts.join("\n").trim();
-        if (!messageText) { log("Bypass: empty message."); return; }
+        if (!messageText) {
+          log("Bypass: empty message.");
+          return;
+        }
 
         // --- Wrap-up injected message: keep WRAP_UP status, bypass classification.
         if (messageText.startsWith(WRAPUP_MARKER)) {
@@ -998,7 +913,10 @@ export default (async (ctx: unknown) => {
         ctxS.failureCount = 0;
 
         const apiKey = resolveApiKey();
-        if (!apiKey) { log("Bypass: no API key."); return; }
+        if (!apiKey) {
+          log("Bypass: no API key.");
+          return;
+        }
 
         log(`Message (preview): ${messageText.substring(0, 100)}`);
 
@@ -1013,11 +931,12 @@ export default (async (ctx: unknown) => {
         ctxS.currentModelStr = currentModelStr;
 
         // Call JEV for routing + complexity
-        const answers = await queryJevRouting(
-          apiKey, messageText, input.sessionID, currentModelStr, availableTools
-        );
+        const answers = await queryJevRouting(apiKey, messageText, input.sessionID, currentModelStr, availableTools);
 
-        if (!answers?.next_tool_domain) { log("JEV returned no answers."); return; }
+        if (!answers?.next_tool_domain) {
+          log("JEV returned no answers.");
+          return;
+        }
 
         const domainAns = answers.next_tool_domain as JevChoiceAnswer;
         const compAns = answers.task_complexity as JevScoreAnswer | undefined;
@@ -1030,8 +949,12 @@ export default (async (ctx: unknown) => {
         log(`Complexity: score=${complexityScore.toFixed(2)} conf=${complexityConf.toFixed(2)}`);
 
         const routing = resolveTargetModel(
-          complexityScore, complexityConf,
-          models.smallModel, models.plannerModel, models.codingModel, currentModelStr
+          complexityScore,
+          complexityConf,
+          models.smallModel,
+          models.plannerModel,
+          models.codingModel,
+          currentModelStr,
         );
 
         // Guard: never override to a provider OpenCode cannot serve, otherwise
@@ -1041,7 +964,9 @@ export default (async (ctx: unknown) => {
         if (routing.target !== "core" || routing.modelStr !== currentModelStr) {
           const parsedTarget = parseModelString(routing.modelStr);
           if (!parsedTarget || !isProviderUsable(parsedTarget.providerID, config)) {
-            log(`Override skipped: provider "${parsedTarget?.providerID ?? routing.modelStr}" not configured/authorized. Keeping session model.`);
+            log(
+              `Override skipped: provider "${parsedTarget?.providerID ?? routing.modelStr}" not configured/authorized. Keeping session model.`,
+            );
             routing.target = "core";
             routing.modelStr = currentModelStr;
           }
@@ -1092,7 +1017,7 @@ export default (async (ctx: unknown) => {
     // -------------------------------------------------------------------------
     "tool.execute.before": async (
       input: { tool: string; sessionID: string; callID: string },
-      output: { args: Record<string, unknown> }
+      output: { args: Record<string, unknown> },
     ) => {
       try {
         if (harvestSessionIds.has(input.sessionID)) return;
@@ -1117,7 +1042,7 @@ export default (async (ctx: unknown) => {
         const { isDangerous } = result;
         log(`GUARDRAIL [${input.tool}] danger_probability=${isDangerous.toFixed(2)}`);
 
-        if (isDangerous > 0.80) {
+        if (isDangerous > 0.8) {
           // Log the detection
           try {
             fs.appendFileSync(
@@ -1129,7 +1054,7 @@ export default (async (ctx: unknown) => {
                 tool: input.tool,
                 args: output.args,
                 isDangerous,
-              }) + "\n"
+              }) + "\n",
             );
           } catch (_) {}
 
@@ -1141,7 +1066,7 @@ export default (async (ctx: unknown) => {
             // Hard block: throw prevents the tool from running
             throw new Error(
               `[JEV GUARDRAIL] Potentially destructive action blocked (danger: ${(isDangerous * 100).toFixed(0)}%). ` +
-              `Tool: ${input.tool}. Disable blocking with \`opencode-jev panel\`.`
+                `Tool: ${input.tool}. Disable blocking with \`opencode-jev panel\`.`,
             );
           }
 
@@ -1166,7 +1091,7 @@ export default (async (ctx: unknown) => {
     // -------------------------------------------------------------------------
     "tool.execute.after": async (
       input: { tool: string; sessionID: string; callID: string; args: unknown },
-      output: { title: string; output: string; metadata: unknown }
+      output: { title: string; output: string; metadata: unknown },
     ) => {
       try {
         if (harvestSessionIds.has(input.sessionID)) return;
@@ -1195,13 +1120,7 @@ export default (async (ctx: unknown) => {
         const failurePromise = (async () => {
           if (!apiKey || LOCAL_CONTENT_TOOLS.has(input.tool)) return;
 
-          const result = await queryJevFailureDetect(
-            apiKey,
-            input.tool,
-            output.title,
-            input.args,
-            toolOutput
-          );
+          const result = await queryJevFailureDetect(apiKey, input.tool, output.title, input.args, toolOutput);
           if (!result) return;
 
           const { isFailure } = result;
@@ -1226,7 +1145,7 @@ export default (async (ctx: unknown) => {
                   tool: input.tool,
                   isFailure,
                   failureCount: ctxS.failureCount,
-                }) + "\n"
+                }) + "\n",
               );
             } catch (_) {}
 
@@ -1238,10 +1157,10 @@ export default (async (ctx: unknown) => {
               ctxS.status = "ESCALATED";
               log(
                 `REACTIVE ESCALATION TRIGGERED: ${ctxS.failureCount} consecutive failures → ` +
-                `next LLM call will force the Planner model.`
+                  `next LLM call will force the Planner model.`,
               );
             }
-          } else if (isFailure < 0.30) {
+          } else if (isFailure < 0.3) {
             // Successful tool call — gradually reset failure counter
             if (ctxS.failureCount > 0) {
               ctxS.failureCount = Math.max(0, ctxS.failureCount - 1);
@@ -1289,7 +1208,7 @@ export default (async (ctx: unknown) => {
                 chars: toolOutput.length,
                 args: input.args ? JSON.stringify(input.args).substring(0, 400) : undefined,
                 raw: toolOutput,
-              }) + "\n"
+              }) + "\n",
             );
           } catch (_) {}
 
@@ -1300,7 +1219,8 @@ export default (async (ctx: unknown) => {
           try {
             jevState.stats = jevState.stats ?? {};
             jevState.stats.harvests = (jevState.stats.harvests ?? 0) + 1;
-            jevState.stats.charsSaved = (jevState.stats.charsSaved ?? 0) + Math.max(0, toolOutput.length - summary.length);
+            jevState.stats.charsSaved =
+              (jevState.stats.charsSaved ?? 0) + Math.max(0, toolOutput.length - summary.length);
             fs.writeFileSync(jevStatePath, JSON.stringify(jevState, null, 2));
           } catch (_) {}
 
@@ -1315,7 +1235,7 @@ export default (async (ctx: unknown) => {
                 request: `[HARVEST] ${input.tool}: ${toolOutput.length} → ${summary.length} chars`,
                 domain: "HARVEST",
                 domainConf: 1,
-              }) + "\n"
+              }) + "\n",
             );
           } catch (_) {}
         }
@@ -1337,7 +1257,7 @@ export default (async (ctx: unknown) => {
     // -------------------------------------------------------------------------
     "experimental.chat.system.transform": async (
       input: { sessionID?: string; model: unknown },
-      output: { system: string[] }
+      output: { system: string[] },
     ) => {
       try {
         if (!input.sessionID) return;
@@ -1356,7 +1276,7 @@ export default (async (ctx: unknown) => {
             const ctxBasket = fs.readFileSync(contextPath, "utf8").trim();
             if (ctxBasket) {
               output.system.push(
-                `[JEV CONTEXT BASKET / MEMORY]\n${ctxBasket}\n(Update: \`opencode-jev context "text"\`)`
+                `[JEV CONTEXT BASKET / MEMORY]\n${ctxBasket}\n(Update: \`opencode-jev context "text"\`)`,
               );
               log("Context basket injected.");
             }
@@ -1384,7 +1304,7 @@ export default (async (ctx: unknown) => {
           ctxS.status = "ESCALATED";
           log(
             `REACTIVE ESCALATION: forcing Planner model mid-loop ` +
-            `(after ${ctxS.failureCount} consecutive tool failures).`
+              `(after ${ctxS.failureCount} consecutive tool failures).`,
           );
 
           // Heavy model — planning variant (deep reasoning/architecture).
@@ -1400,11 +1320,11 @@ export default (async (ctx: unknown) => {
 
           output.system.push(
             `[JEV ESCALATION DIRECTIVE]\n` +
-            `The previous executor model failed repeatedly inside this loop. You are the ESCALATED PLANNER model.\n` +
-            `Original task: ${ctxS.originalRequest || "(unknown — recover from context)"}\n` +
-            `Failures detected: ${ctxS.failureCount} consecutive tool failures.\n` +
-            `Instruction: Reason step-by-step about the root cause, design the architectural solution, ` +
-            `then execute it with minimal, surgical changes. Resolve the blocker and finish the task.`
+              `The previous executor model failed repeatedly inside this loop. You are the ESCALATED PLANNER model.\n` +
+              `Original task: ${ctxS.originalRequest || "(unknown — recover from context)"}\n` +
+              `Failures detected: ${ctxS.failureCount} consecutive tool failures.\n` +
+              `Instruction: Reason step-by-step about the root cause, design the architectural solution, ` +
+              `then execute it with minimal, surgical changes. Resolve the blocker and finish the task.`,
           );
           log("Directive pushed. ESCALATED (rescue cycle).");
 
@@ -1426,16 +1346,16 @@ export default (async (ctx: unknown) => {
             complexityScore < TRIVIAL_THRESHOLD
               ? "TRIVIAL — prefer fast, direct actions; avoid over-engineering"
               : complexityScore > COMPLEX_THRESHOLD
-              ? "COMPLEX — reason carefully step-by-step before acting"
-              : "STANDARD — focused, efficient solution";
+                ? "COMPLEX — reason carefully step-by-step before acting"
+                : "STANDARD — focused, efficient solution";
 
           output.system.push(
             `[JEV ROUTING DIRECTIVE]\n` +
-            `Tool Domain : ${domain} (confidence: ${(domainConfidence * 100).toFixed(0)}%)\n` +
-            `Complexity  : ${complexityLabel} (score: ${complexityScore.toFixed(2)})\n` +
-            `Model Target: ${targetModel.toUpperCase()} (${targetModelStr})\n` +
-            `Instruction : Prioritize the "${domain}" category for your next action. ` +
-            `Adjust reasoning depth to match the complexity level above.`
+              `Tool Domain : ${domain} (confidence: ${(domainConfidence * 100).toFixed(0)}%)\n` +
+              `Complexity  : ${complexityLabel} (score: ${complexityScore.toFixed(2)})\n` +
+              `Model Target: ${targetModel.toUpperCase()} (${targetModelStr})\n` +
+              `Instruction : Prioritize the "${domain}" category for your next action. ` +
+              `Adjust reasoning depth to match the complexity level above.`,
           );
 
           // Belt-and-suspenders model mutation (chat.message is the primary
@@ -1460,4 +1380,4 @@ export default (async (ctx: unknown) => {
       }
     },
   };
-});
+};

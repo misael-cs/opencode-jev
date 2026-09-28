@@ -1,12 +1,13 @@
-import http from 'http';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import { fileURLToPath } from 'url';
-import { parse, modify, applyEdits, ModificationOptions } from 'jsonc-parser';
-import SysTrayModule from 'systray2';
+import { exec } from "child_process";
+import fs from "fs";
+import http from "http";
+import { applyEdits, type ModificationOptions, modify, parse } from "jsonc-parser";
+import os from "os";
+import path from "path";
+import SysTrayModule from "systray2";
+import { fileURLToPath } from "url";
+import { promisify } from "util";
+import { getOpencodeConfigDir } from "./shared.js";
 
 const execAsync = promisify(exec);
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
@@ -16,21 +17,11 @@ const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 // ---------------------------------------------------------------------------
 let port = 19999;
 
-function getOpencodeConfigDir(): string {
-  if (process.platform === "win32") {
-    return path.join(os.homedir(), ".config", "opencode");
-  }
-  const xdg = process.env.XDG_CONFIG_HOME;
-  return xdg
-    ? path.join(xdg, "opencode")
-    : path.join(os.homedir(), ".config", "opencode");
-}
-
 const configDir = getOpencodeConfigDir();
-const stateFile = path.join(configDir, 'jev_state.json');
-const logFile = path.join(configDir, 'jev_debug.log');
-const classLogFile = path.join(configDir, 'jev_classifications.jsonl');
-const configPath = path.join(configDir, 'opencode.jsonc');
+const stateFile = path.join(configDir, "jev_state.json");
+const logFile = path.join(configDir, "jev_debug.log");
+const classLogFile = path.join(configDir, "jev_classifications.jsonl");
+const configPath = path.join(configDir, "opencode.jsonc");
 
 // ---------------------------------------------------------------------------
 // Liveness state (kept for /api/heartbeat; server persists via system tray)
@@ -39,31 +30,41 @@ let hasConnected = false;
 let lastHeartbeat = Date.now();
 
 const openBrowser = (url: string) => {
-    const platform = os.platform();
-    if (platform === 'win32') exec(`start "" "${url}"`);
-    else if (platform === 'darwin') exec(`open "${url}"`);
-    else exec(`xdg-open "${url}"`);
+  const platform = os.platform();
+  if (platform === "win32") exec(`start "" "${url}"`);
+  else if (platform === "darwin") exec(`open "${url}"`);
+  else exec(`xdg-open "${url}"`);
 };
 
 // ---------------------------------------------------------------------------
 // JEV State Management (jev_state.json)
 // ---------------------------------------------------------------------------
 function getJevState() {
-    try {
-        if (fs.existsSync(stateFile)) return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    } catch(e) {}
-    return { enabled: false, confidenceThreshold: 0.6, blockDangerous: false, harvester: { enabled: true, thresholdChars: 3000, timeoutMs: 25000 }, stats: { totalCalls: 0, models: {}, harvests: 0, charsSaved: 0 } };
+  try {
+    if (fs.existsSync(stateFile)) return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  } catch (e) {}
+  return {
+    enabled: false,
+    confidenceThreshold: 0.6,
+    blockDangerous: false,
+    harvester: { enabled: true, thresholdChars: 3000, timeoutMs: 25000 },
+    stats: { totalCalls: 0, models: {}, harvests: 0, charsSaved: 0 },
+  };
 }
 
 function saveJevState(state: any) {
-    if(!fs.existsSync(configDir)) fs.mkdirSync(configDir, {recursive: true});
-    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  if (!fs.existsSync(configDir)) fs.mkdirSync(configDir, { recursive: true });
+  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
 // ---------------------------------------------------------------------------
 // OpenCode Config Management (opencode.jsonc) - Ported from panel.ts
 // ---------------------------------------------------------------------------
-interface ModelEntry { id: string; name: string; provider: string; }
+interface ModelEntry {
+  id: string;
+  name: string;
+  provider: string;
+}
 
 const BUILTIN_MODELS: ModelEntry[] = [
   { id: "opencode/ling-3.0-flash-fin-free", name: "Ling 3.0 Flash Fin Free", provider: "OpenCode Zen" },
@@ -193,7 +194,10 @@ async function saveOpencodeConfig(updates: any): Promise<void> {
     currentText = applyEdits(currentText, modify(currentText, ["small_model"], updates.small_model, options));
   }
   if (updates.harvester_model !== undefined) {
-    currentText = applyEdits(currentText, modify(currentText, ["jev", "harvesterModel"], updates.harvester_model, options));
+    currentText = applyEdits(
+      currentText,
+      modify(currentText, ["jev", "harvesterModel"], updates.harvester_model, options),
+    );
   }
   if (updates.report_model !== undefined) {
     currentText = applyEdits(currentText, modify(currentText, ["jev", "reportModel"], updates.report_model, options));
@@ -212,9 +216,15 @@ async function saveOpencodeConfig(updates: any): Promise<void> {
     const key = updates.openrouter_key.trim();
     if (!key.startsWith("{env:")) {
       await setEnvVarOS("OPENROUTER_API_KEY", key);
-      currentText = applyEdits(currentText, modify(currentText, ["provider", "openrouter", "options", "apiKey"], "{env:OPENROUTER_API_KEY}", options));
+      currentText = applyEdits(
+        currentText,
+        modify(currentText, ["provider", "openrouter", "options", "apiKey"], "{env:OPENROUTER_API_KEY}", options),
+      );
     } else {
-      currentText = applyEdits(currentText, modify(currentText, ["provider", "openrouter", "options", "apiKey"], key, options));
+      currentText = applyEdits(
+        currentText,
+        modify(currentText, ["provider", "openrouter", "options", "apiKey"], key, options),
+      );
     }
   }
 
@@ -790,312 +800,303 @@ const html = `<!DOCTYPE html>
 </html>`;
 
 const server = http.createServer(async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
-    if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  if (req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(html);
+  } else if (req.url === "/api/data" && req.method === "GET") {
+    const state = getJevState();
+    const oc = readConfig();
+    const currentKey = oc.provider?.openrouter?.options?.apiKey ?? "";
+    const safeKey = currentKey && !currentKey.startsWith("{env:") ? currentKey : "";
+
+    const data = {
+      state,
+      config: {
+        openrouter_key: safeKey,
+        jev_model: oc.decisionModel ?? "typesafe/jev-1.13",
+        small_model: oc.small_model ?? "",
+        harvester_model: oc.jev?.harvesterModel ?? "",
+        report_model: oc.jev?.reportModel ?? "",
+        planner_model: oc.jev?.plannerModel ?? oc.agent?.plan?.model ?? "",
+        coding_model: oc.jev?.codingModel ?? "",
+        available_models: getAvailableModels(oc),
+      },
+    };
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(data));
+  } else if (req.url === "/api/state" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk.toString()));
+    req.on("end", () => {
+      try {
+        const newState = JSON.parse(body);
+        saveJevState(newState);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(newState));
+      } catch (e) {
+        res.writeHead(400);
+        res.end("Invalid JSON");
+      }
+    });
+  } else if (req.url === "/api/config" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk.toString()));
+    req.on("end", async () => {
+      try {
+        const payload = JSON.parse(body);
+        await saveOpencodeConfig(payload);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end((e as Error).message);
+      }
+    });
+  } else if (req.url === "/api/heartbeat") {
+    hasConnected = true;
+    lastHeartbeat = Date.now();
+    res.writeHead(200, { "Access-Control-Allow-Origin": "*" });
+    res.end("ok");
+  } else if (req.url === "/api/logs") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    if (fs.existsSync(logFile)) {
+      const lines = fs.readFileSync(logFile, "utf8").split("\n").slice(-150);
+      for (const line of lines) {
+        if (line.trim()) res.write(`data: ${line.trim()}\n\n`);
+      }
     }
 
-    if (req.url === '/') {
-        res.writeHead(200, {'Content-Type': 'text/html'});
-        res.end(html);
-    } 
-    else if (req.url === '/api/data' && req.method === 'GET') {
-        const state = getJevState();
-        const oc = readConfig();
-        const currentKey = oc.provider?.openrouter?.options?.apiKey ?? "";
-        const safeKey = currentKey && !currentKey.startsWith("{env:") ? currentKey : "";
-        
-        const data = {
-            state,
-            config: {
-                openrouter_key: safeKey,
-                jev_model: oc.decisionModel ?? "typesafe/jev-1.13",
-                small_model: oc.small_model ?? "",
-                harvester_model: oc.jev?.harvesterModel ?? "",
-                report_model: oc.jev?.reportModel ?? "",
-                planner_model: oc.jev?.plannerModel ?? oc.agent?.plan?.model ?? "",
-                coding_model: oc.jev?.codingModel ?? "",
-                available_models: getAvailableModels(oc)
+    let lastSize = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
+    const interval = setInterval(() => {
+      if (fs.existsSync(logFile)) {
+        const stat = fs.statSync(logFile);
+        if (stat.size > lastSize) {
+          const stream = fs.createReadStream(logFile, { start: lastSize, end: stat.size });
+          let buffer = "";
+          stream.on("data", (chunk) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            for (const line of lines) {
+              if (line.trim()) res.write(`data: ${line.trim()}\n\n`);
             }
-        };
-        res.writeHead(200, {'Content-Type': 'application/json'});
-        res.end(JSON.stringify(data));
-    }
-    else if (req.url === '/api/state' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk.toString());
-        req.on('end', () => {
-            try {
-                const newState = JSON.parse(body);
-                saveJevState(newState);
-                res.writeHead(200, {'Content-Type': 'application/json'});
-                res.end(JSON.stringify(newState));
-            } catch(e) {
-                res.writeHead(400);
-                res.end('Invalid JSON');
-            }
-        });
-    }
-    else if (req.url === '/api/config' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk.toString());
-        req.on('end', async () => {
-            try {
-                const payload = JSON.parse(body);
-                await saveOpencodeConfig(payload);
-                res.writeHead(200, {'Content-Type': 'application/json'});
-                res.end(JSON.stringify({success: true}));
-            } catch(e) {
-                res.writeHead(500);
-                res.end((e as Error).message);
-            }
-        });
-    }
-    else if (req.url === '/api/heartbeat') {
-        hasConnected = true;
-        lastHeartbeat = Date.now();
-        res.writeHead(200, {'Access-Control-Allow-Origin': '*'});
-        res.end('ok');
-    } 
-    else if (req.url === '/api/logs') {
-        res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-        });
+          });
+          lastSize = stat.size;
+        } else if (stat.size < lastSize) {
+          lastSize = stat.size;
+        }
+      }
+    }, 300);
 
-        if (fs.existsSync(logFile)) {
-            const lines = fs.readFileSync(logFile, 'utf8').split('\n').slice(-150);
-            for(const line of lines) {
-                if(line.trim()) res.write(`data: ${line.trim()}\n\n`);
+    req.on("close", () => clearInterval(interval));
+  } else if (req.url === "/api/classifications") {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    });
+
+    if (fs.existsSync(classLogFile)) {
+      const lines = fs.readFileSync(classLogFile, "utf8").split("\n").slice(-150);
+      for (const line of lines) {
+        if (line.trim()) res.write(`data: ${line.trim()}\n\n`);
+      }
+    }
+
+    let lastSize = fs.existsSync(classLogFile) ? fs.statSync(classLogFile).size : 0;
+    const interval = setInterval(() => {
+      if (fs.existsSync(classLogFile)) {
+        const stat = fs.statSync(classLogFile);
+        if (stat.size > lastSize) {
+          const stream = fs.createReadStream(classLogFile, { start: lastSize, end: stat.size });
+          let buffer = "";
+          stream.on("data", (chunk) => {
+            buffer += chunk.toString();
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+            for (const line of lines) {
+              if (line.trim()) res.write(`data: ${line.trim()}\n\n`);
             }
+          });
+          lastSize = stat.size;
+        } else if (stat.size < lastSize) {
+          lastSize = stat.size;
+        }
+      }
+    }, 300);
+
+    req.on("close", () => clearInterval(interval));
+  } else if (req.url === "/api/logs/clear" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => (body += chunk.toString()));
+    req.on("end", () => {
+      try {
+        const { timeframe, type } = JSON.parse(body);
+        const file = type === "advanced" ? logFile : classLogFile;
+
+        if (!fs.existsSync(file)) {
+          res.writeHead(200);
+          return res.end(JSON.stringify({ success: true }));
         }
 
-        let lastSize = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
-        const interval = setInterval(() => {
-            if (fs.existsSync(logFile)) {
-                const stat = fs.statSync(logFile);
-                if (stat.size > lastSize) {
-                    const stream = fs.createReadStream(logFile, { start: lastSize, end: stat.size });
-                    let buffer = '';
-                    stream.on('data', chunk => {
-                        buffer += chunk.toString();
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || ''; 
-                        for(const line of lines) {
-                            if(line.trim()) res.write(`data: ${line.trim()}\n\n`);
-                        }
-                    });
-                    lastSize = stat.size;
-                } else if (stat.size < lastSize) {
-                    lastSize = stat.size;
-                }
-            }
-        }, 300);
+        if (timeframe === "all") {
+          fs.writeFileSync(file, "");
+        } else {
+          const msMap: Record<string, number> = { "5m": 5 * 60000, "30m": 30 * 60000, "1h": 60 * 60000 };
+          const cutoff = Date.now() - (msMap[timeframe] || 0);
 
-        req.on('close', () => clearInterval(interval));
-    }
-    else if (req.url === '/api/classifications') {
-        res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive'
-        });
+          const lines = fs.readFileSync(file, "utf8").split("\n");
+          const keepLines: string[] = [];
 
-        if (fs.existsSync(classLogFile)) {
-            const lines = fs.readFileSync(classLogFile, 'utf8').split('\n').slice(-150);
-            for(const line of lines) {
-                if(line.trim()) res.write(`data: ${line.trim()}\n\n`);
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            let dStr: string | null = null;
+
+            if (type === "advanced") {
+              const match = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+              if (match) dStr = match[1];
+            } else {
+              try {
+                const obj = JSON.parse(line);
+                dStr = obj.timestamp;
+              } catch (e) {}
             }
+
+            let shouldKeep = true;
+            if (dStr) {
+              const lineTime = new Date(dStr.replace(" ", "T")).getTime();
+              if (lineTime > cutoff) {
+                shouldKeep = false;
+              }
+            }
+            if (shouldKeep) keepLines.push(line);
+          }
+          fs.writeFileSync(file, keepLines.join("\n") + (keepLines.length > 0 ? "\n" : ""));
         }
-
-        let lastSize = fs.existsSync(classLogFile) ? fs.statSync(classLogFile).size : 0;
-        const interval = setInterval(() => {
-            if (fs.existsSync(classLogFile)) {
-                const stat = fs.statSync(classLogFile);
-                if (stat.size > lastSize) {
-                    const stream = fs.createReadStream(classLogFile, { start: lastSize, end: stat.size });
-                    let buffer = '';
-                    stream.on('data', chunk => {
-                        buffer += chunk.toString();
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || ''; 
-                        for(const line of lines) {
-                            if(line.trim()) res.write(`data: ${line.trim()}\n\n`);
-                        }
-                    });
-                    lastSize = stat.size;
-                } else if (stat.size < lastSize) {
-                    lastSize = stat.size;
-                }
-            }
-        }, 300);
-
-        req.on('close', () => clearInterval(interval));
-    }
-    else if (req.url === '/api/logs/clear' && req.method === 'POST') {
-        let body = '';
-        req.on('data', chunk => body += chunk.toString());
-        req.on('end', () => {
-            try {
-                const { timeframe, type } = JSON.parse(body);
-                const file = type === 'advanced' ? logFile : classLogFile;
-                
-                if (!fs.existsSync(file)) {
-                    res.writeHead(200);
-                    return res.end(JSON.stringify({success: true}));
-                }
-
-                if (timeframe === 'all') {
-                    fs.writeFileSync(file, '');
-                } else {
-                    const msMap: Record<string, number> = { '5m': 5 * 60000, '30m': 30 * 60000, '1h': 60 * 60000 };
-                    const cutoff = Date.now() - (msMap[timeframe] || 0);
-
-                    const lines = fs.readFileSync(file, 'utf8').split('\n');
-                    const keepLines: string[] = [];
-
-                    for (const line of lines) {
-                        if (!line.trim()) continue;
-                        let dStr: string | null = null;
-                        
-                        if (type === 'advanced') {
-                            const match = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
-                            if (match) dStr = match[1];
-                        } else {
-                            try {
-                                const obj = JSON.parse(line);
-                                dStr = obj.timestamp;
-                            } catch(e) {}
-                        }
-
-                        let shouldKeep = true;
-                        if (dStr) {
-                            const lineTime = new Date(dStr.replace(' ', 'T')).getTime();
-                            if (lineTime > cutoff) {
-                                shouldKeep = false; 
-                            }
-                        }
-                        if (shouldKeep) keepLines.push(line);
-                    }
-                    fs.writeFileSync(file, keepLines.join('\n') + (keepLines.length > 0 ? '\n' : ''));
-                }
-                res.writeHead(200, {'Content-Type': 'application/json'});
-                res.end(JSON.stringify({success: true}));
-            } catch(e) {
-                res.writeHead(500);
-                res.end('Error clearing logs');
-            }
-        });
-    } else {
-        res.writeHead(404);
-        res.end();
-    }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+      } catch (e) {
+        res.writeHead(500);
+        res.end("Error clearing logs");
+      }
+    });
+  } else {
+    res.writeHead(404);
+    res.end();
+  }
 });
 
-server.on('error', (e: any) => {
-    if (e.code === 'EADDRINUSE') {
-        console.log('Dashboard already running. Opening browser...');
-        openBrowser(`http://localhost:${port}`);
-        setTimeout(() => process.exit(0), 1000);
-    }
+server.on("error", (e: any) => {
+  if (e.code === "EADDRINUSE") {
+    console.log("Dashboard already running. Opening browser...");
+    openBrowser(`http://localhost:${port}`);
+    setTimeout(() => process.exit(0), 1000);
+  }
 });
 
 // Entry point used by bin/cli.ts (`opencode-jev panel`). Keeps the dashboard
 // importable without side effects and lets the caller choose the port.
 export function startDashboard(portArg = 19999): void {
-    port = portArg;
-    server.listen(port, () => {
-        console.log(`JEV Dashboard running at http://localhost:${port}`);
-        openBrowser(`http://localhost:${port}`);
-        startSystemTray();
-    });
+  port = portArg;
+  server.listen(port, () => {
+    console.log(`JEV Dashboard running at http://localhost:${port}`);
+    openBrowser(`http://localhost:${port}`);
+    startSystemTray();
+  });
 }
 
 // ---------------------------------------------------------------------------
 // System Tray — keeps the server alive and gives quick access
 // ---------------------------------------------------------------------------
 function resolveIconPath(): string | null {
-    const candidates = [
-        path.join(moduleDir, '..', '..', 'assets', 'jev_icon.ico'),
-        path.join(configDir, 'jev_icon.ico'),
-    ];
-    for (const c of candidates) {
-        if (fs.existsSync(c)) return c;
-    }
-    return null;
+  const candidates = [path.join(moduleDir, "..", "..", "assets", "jev_icon.ico"), path.join(configDir, "jev_icon.ico")];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
 }
 
 function startSystemTray(): void {
-    try {
-        const iconPath = resolveIconPath();
-        if (!iconPath) {
-            console.error('System Tray: jev_icon.ico not found; tray disabled.');
-            return;
-        }
-        const iconData = fs.readFileSync(iconPath).toString('base64');
-        const SysTray = (SysTrayModule as any).default ?? SysTrayModule;
-
-        let systray: any;
-
-        const itemOpen: any = {
-            title: "Abrir Dashboard",
-            tooltip: "Abre o painel no navegador",
-            checked: false,
-            enabled: true,
-            click: () => openBrowser(`http://localhost:${port}`),
-        };
-        const itemToggle: any = {
-            title: "Ligar/Desligar JEV",
-            tooltip: "Alterna o estado do interceptador",
-            checked: false,
-            enabled: true,
-            click: () => {
-                const s = getJevState();
-                s.enabled = !s.enabled;
-                saveJevState(s);
-                itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
-                systray.sendAction({ type: 'update-item', item: itemToggle });
-            },
-        };
-        const itemExit: any = {
-            title: "Encerrar Servidor",
-            tooltip: "Fecha definitivamente o servidor JEV",
-            checked: false,
-            enabled: true,
-            click: () => {
-                systray.kill();
-                setTimeout(() => process.exit(0), 500);
-            },
-        };
-
-        systray = new SysTray({
-            menu: {
-                icon: iconData,
-                title: "JEV Dashboard",
-                tooltip: "JEV Control Center",
-                items: [itemOpen, itemToggle, itemExit],
-            },
-            debug: false,
-            copyDir: true,
-        });
-
-        systray.onClick((action: any) => {
-            if (action.item.click != null) action.item.click();
-        });
-
-        systray.ready()
-            .then(() => {
-                const s = getJevState();
-                itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
-                systray.sendAction({ type: 'update-item', item: itemToggle });
-            })
-            .catch((err: any) => console.error('Falha ao iniciar System Tray:', err));
-    } catch (err) {
-        console.error('Erro no setup do System Tray:', (err as Error).message);
+  try {
+    const iconPath = resolveIconPath();
+    if (!iconPath) {
+      console.error("System Tray: jev_icon.ico not found; tray disabled.");
+      return;
     }
+    const iconData = fs.readFileSync(iconPath).toString("base64");
+    const SysTray = (SysTrayModule as any).default ?? SysTrayModule;
+
+    let systray: any;
+
+    const itemOpen: any = {
+      title: "Abrir Dashboard",
+      tooltip: "Abre o painel no navegador",
+      checked: false,
+      enabled: true,
+      click: () => openBrowser(`http://localhost:${port}`),
+    };
+    const itemToggle: any = {
+      title: "Ligar/Desligar JEV",
+      tooltip: "Alterna o estado do interceptador",
+      checked: false,
+      enabled: true,
+      click: () => {
+        const s = getJevState();
+        s.enabled = !s.enabled;
+        saveJevState(s);
+        itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
+        systray.sendAction({ type: "update-item", item: itemToggle });
+      },
+    };
+    const itemExit: any = {
+      title: "Encerrar Servidor",
+      tooltip: "Fecha definitivamente o servidor JEV",
+      checked: false,
+      enabled: true,
+      click: () => {
+        systray.kill();
+        setTimeout(() => process.exit(0), 500);
+      },
+    };
+
+    systray = new SysTray({
+      menu: {
+        icon: iconData,
+        title: "JEV Dashboard",
+        tooltip: "JEV Control Center",
+        items: [itemOpen, itemToggle, itemExit],
+      },
+      debug: false,
+      copyDir: true,
+    });
+
+    systray.onClick((action: any) => {
+      if (action.item.click != null) action.item.click();
+    });
+
+    systray
+      .ready()
+      .then(() => {
+        const s = getJevState();
+        itemToggle.title = s.enabled ? "Desligar JEV" : "Ligar JEV";
+        systray.sendAction({ type: "update-item", item: itemToggle });
+      })
+      .catch((err: any) => console.error("Falha ao iniciar System Tray:", err));
+  } catch (err) {
+    console.error("Erro no setup do System Tray:", (err as Error).message);
+  }
 }
